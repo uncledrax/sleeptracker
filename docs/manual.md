@@ -4,6 +4,17 @@ The detailed reference for every feature and experiment. Start with the [README]
 quick setup. Commands use the TypeScript tools in `analysis-ts/` (run them from that folder). A few tools
 only exist in the older Python version under `legacy/python/`; those sections say so.
 
+## Pixel Watch 4 first recording
+
+1. Install the branch's debug APK on the watch using Android Studio or wireless ADB. With Windows PowerShell and this repository checked out, `.\gradlew.bat :app:installDebug` builds and installs it on a connected watch.
+2. Open SleepLogger, grant the requested permissions and tap **2-min sensor test**. Keep the watch on your wrist and rest your arm. It stops after two minutes. Check **PPG** separately from **Controller** and **Extended HR**. A rising optical count establishes delivery. Look for a repeatable pulse in the exported trace before assigning channels or interpreting results.
+3. From `analysis-ts` on your PC, run `npm ci`, then `npm run sync`. Tap **Sync to PC**. Alternatively, use a paired ADB connection and `npm run pull`. Inspect `sensor_report.json`, `session.json`, `sensors.txt` and `raw_ppg.csv` in the new session folder. If the optical stream is missing or registers but delivers no events, the inventory and report are still useful.
+4. Run `npm run ppg -- ../sessions/<folder>` to generate the segment and beat reports for a recording with optical data. Try a 30-minute **Overnight PPG** session with **Live view overnight** off and the screen asleep. Compare optical cadence, largest gap, clean minutes and start/end battery with the short test. Then decide whether to record a full night.
+
+New sessions carry the watch's IANA time zone. Explicit offsets in imported Fitbit timestamps take precedence. For older sessions recorded outside Berlin, use `npm run analyze -- ../sessions/<folder> --time-zone Australia/Sydney` (substitute your recording zone). Ambiguous or nonexistent local timestamps at a daylight-saving transition require an explicit offset to be included.
+
+If Android recreates an overnight recording service, it resumes the recording mode in a new folder. `session.json` links the folders using `sessionId`, `segment` and `previousSegment`. Analyse each folder separately and keep the gap between them when comparing results.
+
 ## 1. Prepare the watch
 1. Settings › System › About › Versions › tap **Build number** 7×.
 2. Settings › Developer options › turn on **ADB debugging** and **Wireless debugging**.
@@ -29,16 +40,9 @@ needed to install new app versions.
 cd analysis-ts
 npm run sync        # or npm run ui – both receive sessions in the background
 ```
-On the watch: **Sync to PC** (also runs by itself 3 s after **Stop**). The watch switches Wi-Fi on for the
-transfer, finds the PC by broadcast (UDP 9001, same Wi-Fi), uploads every finished session to `sessions\`
-(HTTP 9002, only missing/changed files, checked by size) and deletes it on the watch once the PC has it
-complete. The session being recorded is never touched. The first time Windows asks whether Node.js may use
-the network: allow **private networks**. Only clients from private address ranges are accepted.
+Tap **Sync to PC** to copy the recording. After a manual **Stop**, the app starts sync once the recording files close. The two-minute probe saves locally and can be synced when convenient. Use this branch's PC receiver. The watch discovers the PC over UDP 9001 and sends its files over HTTP 9002 on the same private Wi-Fi. The watch checks the receiver's file sizes and SHA-256 digests. Ordinary sync keeps watch copies. **Sync and remove copies…** enables optional removal of verified, finalized recordings. Older and interrupted recordings can be copied and stay on the watch.
 
-The **live view** works the same way: `npm run ui`, start a recording, and the watch connects over Wi-Fi by itself
-(the status line on the watch shows "Live ✓ Wi-Fi"). To save battery the watch only looks for the PC during the
-first 15 min of a recording and during the ECG/SpO2 tests; a connection made in that window stays up. With
-wireless debugging on, `adb reverse` (127.0.0.1) is still tried first.
+Run `npm run ui` for live viewing or replay. **Overnight PPG** uses local capture by default. Select **Live view overnight** before starting if you need a live connection. **Start + PPG** keeps its interactive live view.
 
 **Over ADB** (fallback):
 **One command** (watch with wireless debugging on, same Wi-Fi as the PC):
@@ -49,9 +53,7 @@ npm run pull -- --delete     # also deletes on the watch what is complete and id
 npm run pull -- --list       # only shows what is on the watch
 ```
 The watch is found automatically (devices adb knows, otherwise via mDNS, which works once the watch has been
-paired with this PC; otherwise `--serial <IP:port>`). Only files that are missing or differ in size are fetched;
-the transfer is checked against the file sizes on the watch. A session that is still recording is fetched as it
-is and again next time; it is never deleted. `npm run ui` also finds the watch on its own now (no `--serial` needed).
+paired with this PC; otherwise `--serial <IP:port>`). A completed session has a SHA-256 manifest. ADB pull stages and verifies completed files before replacing PC copies. Interrupted or older sessions are copy-only. `--delete` removes only complete recordings verified on both devices.
 
 By hand, if needed: the files are in the app's private folder; with a debug build you can reach them via `run-as`:
 ```
@@ -106,9 +108,7 @@ Tuning knobs at the top of `src/analyze.ts`: `THRESHOLD_K`, `MIN_THRESHOLD` (mov
 If the session folder contains a `fitbit.json` (the night export with `"fitbit": {...}`), the analysis
 reads it automatically (or `--fitbit path/to/file`). That adds:
 - the watch's breathing rate per sleep stage next to the Fitbit values, heart-rate comparison, movement per stage
-- SpO2: minutes below 90 %, desaturations, and `spo2_episodes.csv` with episodes of ≥5 min below 90 %.
-  Each episode is checked for whether the arm stayed still, whether it ends with a movement
-  and whether the heart rate reacts. All three = "probably a pose artifact" (e.g. arm pinned).
+- SpO2 minutes below 90%, desaturations, and `spo2_episodes.csv` for groups of at least five low minutes. The report labels sustained runs and intermittent clusters, gives the longest consecutive low run, and marks insufficient HR data when a pulse-response assessment is unavailable.
 - room climate (tado), plot with hypnogram, Fitbit heart rate and SpO2
 
 ### Breathing rate
@@ -195,8 +195,7 @@ Beat-to-beat analysis:
 ```
 npm run ppg -- ../sessions/<session>       # in analysis-ts; --plot only in legacy/python/ppg.py
 ```
-Picks the channel with the clearest pulse wave, detects every beat, discards sections with movement
-and beats with an atypical shape, computes SDNN/RMSSD from clean intervals and lists
+The TypeScript analyser divides the recording at optical-mode, cadence and clock-gap boundaries. It selects a channel within each stretch and writes the result, exclusions and usable minutes to `ppg_segments.csv`. It rejects motion and atypical beats, computes RMSSD from adjacent accepted intervals within one segment, and lists
 ectopic beat candidates: "premature" (short interval + pause, together ≈ 2 intervals) and
 "missed pulse" (one interval ≈ twice as long). Output: `ppg_summary.txt`, `ppg_beats.csv`,
 `ppg_events.csv`, `ppg.png` with a snippet per candidate. Without a simultaneous ECG these are candidates,
@@ -204,7 +203,7 @@ not findings.
 
 **Felt ectopic beats as a reference:** during a recording the **Felt** button appears. Every
 time you feel a skipped beat, tap it immediately with the other hand (the arm with the watch stays
-still). This writes `felt` with a timestamp to `events.csv`. In PPG mode the screen stays on for the
+still). This writes `felt` with a timestamp to `events.csv`. In interactive **Start + PPG** mode the screen stays on for the
 first 20 min. The PPG analysis then checks the 8 s before each marker for the pattern (premature / missed pulse),
 reports the chance of a random hit and counts automatic candidates without a marker (`ppg_felt.csv`).
 
@@ -262,9 +261,7 @@ npm run sync                                      # receive sessions from the wa
 npm run pull                                      # fetch sessions over adb instead
 npm test                                          # DSP and parsers against reference values
 ```
-The TypeScript tools were checked against the original Python scripts: `summary.txt` character-identical on
-three nights, `ppg_summary.txt` identical on a test session and a PPG night. Not ported yet (Python only, in
-`legacy/python/`): plots (`--plot`), `audio.py`, `breath_hold.py`, `nights.py`, `ppg_probe.py`, `simulate.py`.
+Use TypeScript for segment-aware PPG analysis and current reports. The archived Python PPG plotting tool selects one channel across the recording and writes its own report files; run it on a copy if you need its plots. Python-only tools include plots (`--plot`), `audio.py`, `breath_hold.py`, `nights.py`, `ppg_probe.py`, `simulate.py`.
 
 ## 10. ECG test (experimental)
 Checks whether a third-party app gets raw ECG data from the Pixel Watch. The watch lists two undocumented
@@ -278,7 +275,7 @@ Procedure (like the Fitbit ECG app):
 2. On the watch: **ECG test** (below "Start + PPG", only visible while nothing is recording).
 3. Immediately put a finger of the other hand on the crown (touch, don't press) and keep it there.
    The watch shows "Finger on the crown", a countdown, the number of ECG events and the last lead-detector value.
-4. After 60 s the test stops by itself. "Ready" then shows the result, e.g. `ECG: 15000 events, 250 Hz`
+4. After 150 s the test stops by itself. "Ready" then shows the result, e.g. `ECG: 15000 events, 250 Hz`
    or `ECG blocked? 0 events` (plus a toast).
 
 The test writes its own session folder with only `raw_ecg.csv`, `raw_ecg_lead.csv` (format as for PPG:

@@ -39,22 +39,34 @@ def find_export(session: Path, explicit: Path | None = None):
     return None, None
 
 
-def _local(series):
-    return pd.to_datetime(series).dt.tz_localize(TZ, ambiguous="NaT", nonexistent="shift_forward")
+def session_zone(session):
+    meta = Path(session) / "session.json"
+    return json.loads(meta.read_text(encoding="utf-8")).get("timeZone", TZ) if meta.exists() else TZ
 
 
-def load(data: dict):
+def _local(series, zone):
+    def parse(value):
+        stamp = pd.to_datetime(value, errors="coerce")
+        if pd.isna(stamp):
+            return pd.NaT
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize(zone, ambiguous="NaT", nonexistent="NaT")
+        return stamp
+    return pd.to_datetime(series.map(parse), utc=True).dt.tz_convert(zone)
+
+
+def load(data: dict, zone=TZ):
     fb = data["fitbit"]
     out = {"vitals": fb.get("vitals") or {}, "sleep": fb.get("sleep") or {}}
     tl = pd.DataFrame(out["sleep"].get("timeline") or [])
     if not tl.empty:
-        tl["start"] = _local(tl.start)
+        tl["start"] = _local(tl.start, zone)
         tl["end"] = tl.start + pd.to_timedelta(tl.minutes, unit="min")
     out["stages"] = tl
     for key, src, col in (("hr", "heartRatePerMinute", "bpm"), ("spo2", "spo2PerMinute", "value"),
                           ("hrv", "hrvPer5Minutes", "value")):
         df = pd.DataFrame(fb.get(src) or [])
-        out[key] = (df.assign(t=_local(df.time).dt.floor("min")).dropna(subset=["t"])
+        out[key] = (df.assign(t=_local(df.time, zone).dt.tz_convert("UTC").dt.floor("min")).dropna(subset=["t"])
                     .set_index("t")[col].groupby(level=0).mean()) if not df.empty else pd.Series(dtype=float)
     room = pd.DataFrame((data.get("tado") or {}).get("readings") or [])
     out["room"] = room
@@ -69,9 +81,9 @@ def stage_at(stages: pd.DataFrame, times):
     return out
 
 
-def wrist_pose(acc: pd.DataFrame):
+def wrist_pose(acc: pd.DataFrame, zone=TZ):
     """Gravity direction per minute (unit vector) and angle change to the previous minute."""
-    t = pd.to_datetime(acc.epoch_ms, unit="ms", utc=True).dt.tz_convert(TZ)
+    t = pd.to_datetime(acc.epoch_ms, unit="ms", utc=True).dt.tz_convert(zone)
     g = acc.set_index(t)[["x", "y", "z"]].resample("1min").median()
     g = g.div(np.linalg.norm(g.values, axis=1), axis=0)
     prev = g.shift()
@@ -111,19 +123,23 @@ def low_spo2_episodes(m: pd.DataFrame, events: pd.DataFrame):
     out = []
     for ep in rows:
         a, b = ep[0], ep[-1] + pd.Timedelta("1min")
+        steps = pd.Series(ep).diff()
+        longest = int(steps.ne(pd.Timedelta("1min")).cumsum().value_counts().max())
+        pattern = "sustained" if len(ep) == longest else "intermittent"
         seg = m.loc[a:b - pd.Timedelta("1min")]
         core = seg.iloc[:-2] if len(seg) > 4 else seg   # without the final movement
         pose_change = core.pose_change_deg.iloc[1:].max() if len(core) > 1 else 0.0
         ends_with_move = bool(((mv_t >= b - pd.Timedelta("3min")) & (mv_t <= b + pd.Timedelta("2min"))).any())
         hr_rise = (core.hr_max.max() - core.hr_mean.median()) if "hr_max" in core else np.nan
         still = (pose_change or 0) < POSE_STILL_DEG
-        verdict = ("probably a pose artifact (arm still, ends with movement, heart rate calm)"
-                   if still and ends_with_move and (np.isnan(hr_rise) or hr_rise < 10) else "unclear")
+        verdict = "insufficient HR data" if not np.isfinite(hr_rise) else "unclear"
+        if still and ends_with_move and np.isfinite(hr_rise) and hr_rise < 10:
+            verdict = "probably a pose artifact (arm still, ends with movement, heart rate calm)"
         out.append({"start": a, "end": b, "minutes": len(ep), "spo2_min": seg.spo2.min(),
                     "spo2_mean": seg.spo2.mean(), "max_pose_change_deg": pose_change,
                     "ends_with_movement": ends_with_move, "hr_rise_bpm": hr_rise,
                     "stage": seg.stage.mode().iloc[0] if "stage" in seg and seg.stage.notna().any() else None,
-                    "verdict": verdict})
+                    "verdict": verdict, "pattern": pattern, "longest_run_minutes": longest})
     return pd.DataFrame(out)
 
 

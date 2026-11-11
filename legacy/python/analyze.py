@@ -14,6 +14,7 @@ import argparse
 import warnings
 from pathlib import Path
 
+import fitbit as F
 import numpy as np
 import pandas as pd
 from scipy import signal
@@ -33,11 +34,12 @@ CVHR_CYCLE_S = (25, 100)     # spacing of consecutive spikes
 CVHR_MIN_CYCLES = 4
 
 
-def load(session: Path):
+def load(session: Path, zone=None):
+    zone = zone or F.session_zone(session)
     acc = pd.read_csv(session / "accel.csv")
     hr = pd.read_csv(session / "hr.csv")
-    acc["t"] = pd.to_datetime(acc.epoch_ms, unit="ms", utc=True).dt.tz_convert("Europe/Berlin")
-    hr["t"] = pd.to_datetime(hr.epoch_ms, unit="ms", utc=True).dt.tz_convert("Europe/Berlin")
+    acc["t"] = pd.to_datetime(acc.epoch_ms, unit="ms", utc=True).dt.tz_convert(zone)
+    hr["t"] = pd.to_datetime(hr.epoch_ms, unit="ms", utc=True).dt.tz_convert(zone)
     hr = hr[(hr.bpm > 30) & (hr.accuracy >= 2)]  # 0/1 = unreliable or no skin contact
     gyro_path = session / "gyro.csv"
     gyro = pd.read_csv(gyro_path).sort_values("epoch_ms") if gyro_path.exists() else None
@@ -261,7 +263,7 @@ def battery_drain(session: Path):
     return pct.iloc[0], pct.iloc[-1], (pct.iloc[0] - pct.iloc[-1]) / max(hours, 1e-9)
 
 
-def per_minute(grid, activity, events, hr, breath, cvhr):
+def per_minute(grid, activity, events, hr, breath, cvhr, zone=F.TZ):
     df = pd.DataFrame({"epoch_ms": grid, "activity": activity})
     df["minute"] = (df.epoch_ms // 60000) * 60000
     m = df.groupby("minute").activity.mean().to_frame("activity_mean")
@@ -279,7 +281,7 @@ def per_minute(grid, activity, events, hr, breath, cvhr):
     m["cvhr_episode"] = False
     for _, e in cvhr.iterrows():
         m.loc[(m.index >= e.start_ms - 60000) & (m.index <= e.end_ms), "cvhr_episode"] = True
-    m.index = pd.to_datetime(m.index, unit="ms", utc=True).tz_convert("Europe/Berlin")
+    m.index = pd.to_datetime(m.index, unit="ms", utc=True).tz_convert(zone)
     return m
 
 
@@ -289,9 +291,11 @@ def main():
     ap.add_argument("--fs", type=float, default=25.0)
     ap.add_argument("--plot", action="store_true")
     ap.add_argument("--fitbit", type=Path, help="Fitbit export (default: fitbit.json in the session folder)")
+    ap.add_argument("--time-zone", help="IANA time zone for offset-free input and reports")
     args = ap.parse_args()
+    zone = args.time_zone or F.session_zone(args.session)
 
-    acc, gyro, hr = load(args.session)
+    acc, gyro, hr = load(args.session, zone)
     grid = np.arange(acc.epoch_ms.iloc[0], acc.epoch_ms.iloc[-1], 1000.0 / args.fs)
     xyz = resample(acc, grid)
     sources = {"accel": xyz}
@@ -301,14 +305,13 @@ def main():
     events = hr_response(events, hr)
     breath = breathing_estimates(grid, sources, activity, thr, args.fs)
     cvhr, cvhr_peaks = cvhr_episodes(hr, events)
-    minutes = per_minute(grid, activity, events, hr, breath, cvhr)
+    minutes = per_minute(grid, activity, events, hr, breath, cvhr, zone)
 
-    import fitbit as F
     fb_data, fb_path = F.find_export(args.session, args.fitbit)
     fb = episodes = None
     if fb_data:
-        fb = F.load(fb_data)
-        minutes = F.annotate(minutes, fb, F.wrist_pose(acc))
+        fb = F.load(fb_data, zone)
+        minutes = F.annotate(minutes, fb, F.wrist_pose(acc, zone))
         episodes = F.low_spo2_episodes(minutes, events)
 
     hours = (grid[-1] - grid[0]) / 3.6e6
@@ -389,8 +392,8 @@ def main():
                 ax[2].legend(loc="upper right")
             ax[2].set_ylabel("Heart rate")
             for _, e in cvhr.iterrows():
-                ax[2].axvspan(pd.to_datetime(e.start_ms, unit="ms", utc=True).tz_convert("Europe/Berlin"),
-                              pd.to_datetime(e.end_ms, unit="ms", utc=True).tz_convert("Europe/Berlin"),
+                ax[2].axvspan(pd.to_datetime(e.start_ms, unit="ms", utc=True).tz_convert(zone),
+                              pd.to_datetime(e.end_ms, unit="ms", utc=True).tz_convert(zone),
                               color="tab:red", alpha=0.2)
         if "breaths_per_min" in minutes and "stage" in minutes:
             col = {"wake": "tab:red", "rem": "tab:purple", "light": "tab:cyan", "deep": "tab:blue"}

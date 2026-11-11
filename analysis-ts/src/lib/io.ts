@@ -2,7 +2,16 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-export const TZ = "Europe/Berlin";
+// Sessions written before timeZone metadata used Berlin local time.
+const LEGACY_ZONE = "Europe/Berlin";
+
+export function sessionTimeZone(session: string, override?: string): string {
+  const path = join(session, "session.json");
+  const zone = override ?? (existsSync(path) ? JSON.parse(readFileSync(path, "utf8")).timeZone : undefined) ?? LEGACY_ZONE;
+  if (typeof zone !== "string" || !zone) throw new Error("Invalid session time zone");
+  formatter(zone);  // validates the IANA ID, including explicit CLI overrides
+  return zone;
+}
 
 /** Numeric CSV columns (header row, comma-separated) as Float64Arrays. Non-numbers become NaN. */
 export function readNumericCsv(path: string, cols?: string[]): Record<string, Float64Array> {
@@ -62,47 +71,61 @@ export function sortBy(cols: Record<string, Float64Array>, key: string): Record<
 }
 
 const fmtCache = new Map<string, Intl.DateTimeFormat>();
-function parts(ms: number) {
-  let f = fmtCache.get("p");
-  if (!f) {
-    f = new Intl.DateTimeFormat("en-GB", {
-      timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit",
+function formatter(zone: string): Intl.DateTimeFormat {
+  let fmt = fmtCache.get(zone);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat("en-GB", {
+      timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit",
       hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
     });
-    fmtCache.set("p", f);
+    fmtCache.set(zone, fmt);
   }
-  const o: Record<string, string> = {};
-  for (const p of f.formatToParts(new Date(ms))) o[p.type] = p.value;
-  return o;
+  return fmt;
 }
 
-/** Offset of Berlin against UTC in minutes for a point in time. */
-export function tzOffsetMin(ms: number): number {
-  const o = parts(ms);
+function parts(ms: number, zone: string) {
+  const out: Record<string, string> = {};
+  for (const p of formatter(zone).formatToParts(ms)) out[p.type] = p.value;
+  return out;
+}
+
+function tzOffsetMin(ms: number, zone: string): number {
+  const o = parts(ms, zone);
   const asUtc = Date.UTC(+o.year, +o.month - 1, +o.day, +o.hour, +o.minute, +o.second);
-  return Math.round((asUtc - Math.floor(ms / 1000) * 1000) / 60000);
+  return (asUtc - Math.floor(ms / 1000) * 1000) / 60000;
 }
 
-export const hms = (ms: number) => { const o = parts(ms); return `${o.hour}:${o.minute}:${o.second}`; };
-export const hm = (ms: number) => { const o = parts(ms); return `${o.hour}:${o.minute}`; };
+export function hms(ms: number, zone = LEGACY_ZONE): string {
+  const o = parts(ms, zone);
+  return `${o.hour}:${o.minute}:${o.second}`;
+}
 
-/** "2026-11-03 23:06:00+01:00" like pandas in CSV export. */
-export function isoLocal(ms: number): string {
-  const o = parts(ms);
-  const off = tzOffsetMin(ms);
-  const s = off < 0 ? "-" : "+";
+export function hm(ms: number, zone = LEGACY_ZONE): string {
+  return hms(ms, zone).slice(0, 5);
+}
+
+export function isoLocal(ms: number, zone = LEGACY_ZONE): string {
+  const o = parts(ms, zone);
+  const off = tzOffsetMin(ms, zone);
+  const sign = off < 0 ? "-" : "+";
   const a = Math.abs(off);
-  return `${o.year}-${o.month}-${o.day} ${o.hour}:${o.minute}:${o.second}${s}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
+  return `${o.year}-${o.month}-${o.day} ${o.hour}:${o.minute}:${o.second}${sign}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
 }
 
-/** Local Berlin time without offset ("2026-11-04T01:02:00.000") -> epoch ms. */
-export function berlinToEpoch(local: string): number {
-  const m = local.match(/^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d)(?:\.(\d+))?)?/);
+/** Explicit ISO offsets are authoritative. Skip nonexistent or ambiguous offset-free local times. */
+export function timestampToEpoch(value: string, zone = LEGACY_ZONE): number {
+  if (typeof value !== "string") return NaN;
+  const m = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(?::(\d{2})(?:\.(\d+))?)?(Z|[+-]\d{2}:?\d{2})?$/i.exec(value.trim());
   if (!m) return NaN;
-  const naive = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] ?? 0), m[7] ? +m[7].slice(0, 3).padEnd(3, "0") : 0);
-  let t = naive - tzOffsetMin(naive) * 60000;
-  t = naive - tzOffsetMin(t) * 60000;
-  return t;
+  const wall = `${m[1]}T${m[2]}:${m[3] ?? "00"}.${(m[4] ?? "").padEnd(3, "0").slice(0, 3)}`;
+  const naive = Date.parse(wall + "Z");
+  if (!Number.isFinite(naive) || new Date(naive).toISOString() !== wall + "Z") return NaN;
+  if (m[5]) return Date.parse(wall + m[5]);
+  const day = 86400000;
+  const offsets = new Set([tzOffsetMin(naive - day, zone), tzOffsetMin(naive + day, zone)]);
+  const matches = Array.from(offsets, (offset) => naive - offset * 60000)
+    .filter((instant) => instant + tzOffsetMin(instant, zone) * 60000 === naive);
+  return matches.length === 1 ? matches[0] : NaN;
 }
 
 /** Number like Python repr (shortest representation, NaN empty like pandas). */

@@ -9,13 +9,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 
-/**
- * Sends finished sessions to the PC over Wi-Fi (npm run ui or npm run sync must be running there).
- *   GET  http://<pc>:<sync>/sessions/<name>        -> {"files": {"accel.csv": 123, …}} (complete files only)
- *   PUT  http://<pc>:<sync>/sessions/<name>/<file> -> body = file, answer {"size": n}
- * Only files missing or of a different size on the PC are sent. After a session is confirmed complete on the
- * PC (all sizes equal) it is deleted on the watch (deleteAfter). The session that is still recording is skipped.
- */
+/** Copies watch recordings to the PC. Cleanup requires a finalized manifest and matching hashes. */
 object SessionSync {
     private const val TAG = "SessionSync"
     @Volatile var running = false
@@ -23,7 +17,7 @@ object SessionSync {
     @Volatile var status = ""
         private set
 
-    fun start(ctx: Context, deleteAfter: Boolean = true) {
+    fun start(ctx: Context, deleteAfter: Boolean = false) {
         synchronized(this) {
             if (running) return
             running = true
@@ -42,30 +36,43 @@ object SessionSync {
             status = "Sync: looking for PC …"
             val pc = WifiLink.findPc(ctx, net, 4000) ?: return fail("PC not found (npm run sync running?)")
             val base = "http://${pc.host.hostAddress}:${pc.syncPort}/sessions"
-            val skip = if (SensorLoggerService.isRunning) SensorLoggerService.currentSession else null
             val dirs = (File(ctx.filesDir, "sessions").listFiles() ?: emptyArray())
-                .filter { it.isDirectory && it.name != skip && it.name.matches(Regex("\\d{8}_\\d{6}")) }
+                .filter { it.isDirectory && it.name.matches(Regex("\\d{8}_\\d{6}")) }
                 .sortedBy { it.name }
-            if (dirs.isEmpty()) { status = "Sync: nothing to send"; return }
             var sentBytes = 0L
-            var done = 0
-            for ((i, d) in dirs.withIndex()) {
-                val files = (d.listFiles() ?: emptyArray()).filter { it.isFile }
-                var remote = remoteSizes(net, "$base/${d.name}")
-                for (f in files) {
-                    if (remote[f.name] == f.length()) continue
-                    status = "Sync ${i + 1}/${dirs.size}: ${f.name} ${f.length() / 1_000_000} MB"
-                    put(net, "$base/${d.name}/${URLEncoder.encode(f.name, "UTF-8")}", f)
-                    sentBytes += f.length()
+            var copied = 0
+            var deleted = 0
+            for (d in dirs) {
+                if (d.name == SensorLoggerService.currentSession) continue
+                val metadata = File(d, "session.json")
+                if (metadata.isFile && JSONObject(metadata.readText()).optString("state") == "recording") continue
+                val sealed = SessionManifest.sealedFiles(d)
+                val expected = sealed ?: SessionManifest.files(d).associate { it.name to SessionManifest.digest(it) }
+                if (expected.isEmpty()) continue
+                val url = "$base/${d.name}"
+                var remote = remoteDigests(net, url)
+                // Publish the completion manifest only after its recording files.
+                for ((name, digest) in expected.entries.sortedBy { it.key == SessionManifest.NAME }) {
+                    if (remote[name] == digest) continue
+                    status = "Sync ${d.name}: $name ${digest.bytes / 1_000_000} MB"
+                    put(net, "$url/${URLEncoder.encode(name, "UTF-8")}", File(d, name), digest)
+                    sentBytes += digest.bytes
                 }
-                remote = remoteSizes(net, "$base/${d.name}")
-                val complete = files.all { remote[it.name] == it.length() }
-                if (!complete) return fail("${d.name} incomplete on the PC")
-                done++
-                if (deleteAfter) d.deleteRecursively()
+                remote = remoteDigests(net, url)
+                check(expected.all { remote[it.key] == it.value }) { "${d.name}: PC verification failed" }
+                copied++
+                if (deleteAfter && sealed != null && d.name != SensorLoggerService.currentSession) {
+                    check(SessionManifest.sealedFiles(d) == sealed &&
+                          expected.all { SessionManifest.digest(File(d, it.key)) == it.value }) {
+                        "${d.name}: originals changed, retained on watch"
+                    }
+                    check(d.deleteRecursively()) { "${d.name}: watch cleanup failed" }
+                    deleted++
+                }
             }
-            status = "Sync ✓ $done session(s), ${sentBytes / 1_000_000} MB → ${pc.name.ifEmpty { pc.host.hostAddress }}" +
-                if (deleteAfter) ", deleted here" else ""
+            status = if (copied == 0) "Sync: nothing ready to send" else
+                "Sync ✓ $copied session(s), ${sentBytes / 1_000_000} MB → ${pc.name.ifEmpty { pc.host.hostAddress }}" +
+                    if (deleteAfter) ", removed $deleted verified session(s)" else ", kept on watch"
         } catch (e: Exception) {
             Log.w(TAG, "sync failed", e)
             fail(e.message ?: e.javaClass.simpleName)
@@ -78,26 +85,33 @@ object SessionSync {
 
     private fun fail(msg: String) { status = "Sync failed: $msg" }
 
-    private fun remoteSizes(net: android.net.Network, url: String): Map<String, Long> {
-        val c = net.openConnection(URL(url)) as HttpURLConnection
-        c.connectTimeout = 5000; c.readTimeout = 15000
+    private fun remoteDigests(net: android.net.Network, url: String): Map<String, SessionManifest.Digest> {
+        val c = net.openConnection(URL("$url?hashes=1")) as HttpURLConnection
+        c.connectTimeout = 5000; c.readTimeout = 180_000
         try {
-            if (c.responseCode != 200) throw RuntimeException("PC answered ${c.responseCode}")
-            val files = JSONObject(c.inputStream.bufferedReader().readText()).getJSONObject("files")
-            return files.keys().asSequence().associateWith { files.getLong(it) }
+            check(c.responseCode == 200) { "PC answered ${c.responseCode}" }
+            val receipt = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
+            val hashes = receipt.optJSONObject("sha256") ?: error("Update the PC receiver for verified sync")
+            val sizes = receipt.getJSONObject("files")
+            return hashes.keys().asSequence().associateWith { SessionManifest.Digest(sizes.getLong(it), hashes.getString(it)) }
         } finally { c.disconnect() }
     }
 
-    private fun put(net: android.net.Network, url: String, f: File) {
+    private fun put(net: android.net.Network, url: String, f: File, expected: SessionManifest.Digest) {
         val c = net.openConnection(URL(url)) as HttpURLConnection
         c.connectTimeout = 5000; c.readTimeout = 60_000
         c.requestMethod = "PUT"
         c.doOutput = true
-        c.setFixedLengthStreamingMode(f.length())
+        c.setFixedLengthStreamingMode(expected.bytes)
         c.setRequestProperty("Content-Type", "application/octet-stream")
+        c.setRequestProperty("X-Content-SHA256", expected.sha256)
         try {
             c.outputStream.use { out -> f.inputStream().use { it.copyTo(out, 64 * 1024) } }
-            if (c.responseCode != 200) throw RuntimeException("upload ${f.name}: PC answered ${c.responseCode}")
+            check(c.responseCode == 200) { "upload ${f.name}: PC answered ${c.responseCode}" }
+            val response = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
+            check(response.getString("sha256") == expected.sha256 && response.getLong("size") == expected.bytes) {
+                "upload ${f.name}: PC digest mismatch"
+            }
         } finally { c.disconnect() }
     }
 }

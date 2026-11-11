@@ -1,5 +1,6 @@
 package de.alex.sleeplogger
 
+import android.app.AlertDialog
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -10,6 +11,7 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
+import android.widget.CheckBox
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -22,6 +24,10 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var status: TextView
     private lateinit var toggle: Button
+    private lateinit var probeButton: Button
+    private lateinit var overnightButton: Button
+    private lateinit var overnightLive: CheckBox
+    private lateinit var cleanupButton: Button
     private lateinit var rawButton: Button
     private lateinit var markButton: Button
     private lateinit var poseHeader: TextView
@@ -30,10 +36,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var spo2Button: Button
     private lateinit var syncButton: Button
     private val clockFmt = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
-    private var pendingMode = Mode.NORMAL
+    private var pendingMode = RecordingMode.NORMAL
     private var shownEcgResult: String? = null
 
-    private enum class Mode { NORMAL, RAW, ECG, SPO2 }
     private val ui = Handler(Looper.getMainLooper())
 
     private val requiredPermissions: Array<String>
@@ -64,17 +69,36 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (!SensorLoggerService.isRunning) {
+            val sessions = RecordingSessions(this)
+            // A process death between Stop and finalization must leave the old recording available to sync.
+            runCatching { sessions.recoverStopped() }.onFailure {
+                android.util.Log.w("SleepLogger", "Could not recover interrupted stop", it)
+            }
+        }
         val dm = resources.displayMetrics
         status = TextView(this).apply { gravity = Gravity.CENTER; textSize = 12f; setPadding(0, 8, 0, 8) }
-        toggle = Button(this).apply { setOnClickListener { onToggle(Mode.NORMAL) } }
-        // additionally record the raw PPG sensors (first as a short test, data volume unknown)
-        rawButton = Button(this).apply { text = "Start + PPG"; setOnClickListener { onToggle(Mode.RAW) } }
+        toggle = Button(this).apply { setOnClickListener { onToggle(RecordingMode.NORMAL) } }
+        probeButton = Button(this).apply { text = "2-min sensor test"; setOnClickListener { onToggle(RecordingMode.PROBE) } }
+        overnightButton = Button(this).apply { text = "Overnight PPG"; setOnClickListener { onToggle(RecordingMode.OVERNIGHT) } }
+        overnightLive = CheckBox(this).apply { text = "Live view overnight"; isChecked = false }
+        rawButton = Button(this).apply { text = "Start + PPG"; setOnClickListener { onToggle(RecordingMode.RAW) } }
         // experimental: 150 s (2 min usable for HRV) with the undocumented ECG sensors, finger of the other hand on the crown
-        ecgButton = Button(this).apply { text = "ECG test"; setOnClickListener { onToggle(Mode.ECG) } }
+        ecgButton = Button(this).apply { text = "ECG test"; setOnClickListener { onToggle(RecordingMode.ECG) } }
         // SpO2 calibration: PPG recording, large clock, screen stays on (film watch + oximeter together)
-        spo2Button = Button(this).apply { text = "SpO2 test"; setOnClickListener { onToggle(Mode.SPO2) } }
-        // send finished sessions to the PC over Wi-Fi (npm run sync / npm run ui there), then delete them here
+        spo2Button = Button(this).apply { text = "SpO2 test"; setOnClickListener { onToggle(RecordingMode.SPO2) } }
+        // Ordinary Wi-Fi sync retains the watch files.
         syncButton = Button(this).apply { text = "Sync to PC"; setOnClickListener { SessionSync.start(this@MainActivity) } }
+        cleanupButton = Button(this).apply {
+            text = "Sync and remove copies…"
+            setOnClickListener {
+                AlertDialog.Builder(this@MainActivity)
+                    .setMessage("Remove completed recordings from this watch after verifying them on the PC? Check your intended receiver is running on your trusted Wi-Fi.")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Sync and remove") { _, _ -> SessionSync.start(this@MainActivity, deleteAfter = true) }
+                    .show()
+            }
+        }
         // ectopic beat felt -> time marker in events.csv ("felt"), as a reference for ppg.py
         markButton = Button(this).apply {
             text = "Felt"
@@ -116,6 +140,9 @@ class MainActivity : ComponentActivity() {
             addView(status)
             addView(toggle, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT))
+            for (view in listOf(probeButton, overnightButton, overnightLive)) {
+                addView(view, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            }
             addView(rawButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT))
             addView(ecgButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
@@ -124,6 +151,7 @@ class MainActivity : ComponentActivity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT))
             addView(syncButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(cleanupButton)
             addView(poseHeader)
             poseButtons.values.forEach {
                 addView(it, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
@@ -143,13 +171,11 @@ class MainActivity : ComponentActivity() {
     override fun onResume() { super.onResume(); ui.post(refresh) }
     override fun onPause() { super.onPause(); ui.removeCallbacks(refresh) }
 
-    private fun onToggle(mode: Mode) {
+    private fun onToggle(mode: RecordingMode) {
         pendingMode = mode
         if (SensorLoggerService.isRunning) {
             startService(Intent(this, SensorLoggerService::class.java)
                 .setAction(SensorLoggerService.ACTION_STOP))
-            // after Stop: send the night to the PC if it is reachable (files are closed after ~1 s)
-            ui.postDelayed({ if (!SensorLoggerService.isRunning) SessionSync.start(this) }, 3000)
         } else if (requiredPermissions.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
             startLogger(mode)
         } else {
@@ -157,22 +183,31 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startLogger(mode: Mode) {
+    private fun startLogger(mode: RecordingMode) {
         startForegroundService(Intent(this, SensorLoggerService::class.java)
-            .putExtra(SensorLoggerService.EXTRA_RAW, mode == Mode.RAW)
-            .putExtra(SensorLoggerService.EXTRA_ECG_TEST, mode == Mode.ECG)
-            .putExtra(SensorLoggerService.EXTRA_SPO2_TEST, mode == Mode.SPO2))
+            .putExtra(SensorLoggerService.EXTRA_MODE, mode.name)
+            .putExtra(SensorLoggerService.EXTRA_LIVE, mode != RecordingMode.OVERNIGHT || overnightLive.isChecked))
     }
 
     private fun render() {
         status.textSize = 12f
+        val idle = !SensorLoggerService.isRunning
+        for (view in listOf(probeButton, overnightButton, overnightLive, cleanupButton)) {
+            view.visibility = if (idle) View.VISIBLE else View.GONE
+        }
+        cleanupButton.isEnabled = !SessionSync.running
+        toggle.isEnabled = !SensorLoggerService.finishing
+        if (SensorLoggerService.finishing) {
+            status.text = "Saving recording…"
+            return
+        }
         if (SensorLoggerService.isRunning && SensorLoggerService.spo2Mode) {
             val now = System.currentTimeMillis()
             status.textSize = 30f
             status.text = clockFmt.format(java.util.Date(now)) + "." + (now % 1000) / 100
             toggle.text = "Stop"
             markButton.visibility = View.GONE
-            poseHeader.text = "SpO2 test · PPG ${SensorLoggerService.rawCount / 1000}k" +
+            poseHeader.text = "SpO2 test · ${SensorLoggerService.rawStatus}" +
                 (if (SensorLoggerService.liveConnected) " · Live ✓ ${SensorLoggerService.liveVia}" else "")
             poseHeader.visibility = View.VISIBLE
             poseButtons.values.forEach { it.visibility = View.GONE }
@@ -199,7 +234,9 @@ class MainActivity : ComponentActivity() {
         } else if (SensorLoggerService.isRunning) {
             // keep it short so "Felt" and "Stop" fit on the screen without scrolling
             status.text = "${SensorLoggerService.lastBpm.toInt()} bpm · felt ${SensorLoggerService.markCount}\n" +
-                (if (SensorLoggerService.rawMode) "PPG ${SensorLoggerService.rawCount / 1000}k" else "no PPG") +
+                (if (SensorLoggerService.mode == RecordingMode.PROBE)
+                    "Sensor test · ${((SensorLoggerService.testEndsAtMs - System.currentTimeMillis()) / 1000).coerceAtLeast(0)}s\n" else "") +
+                (if (SensorLoggerService.rawMode) SensorLoggerService.rawStatus else "no PPG") +
                 (if (SensorLoggerService.liveConnected) " · Live ✓ ${SensorLoggerService.liveVia}" else "")
             toggle.text = "Stop"
             rawButton.visibility = View.GONE
@@ -220,14 +257,16 @@ class MainActivity : ComponentActivity() {
             // In the PPG test keep the screen on for the first 20 min so "Felt" takes a single tap.
             // After that (e.g. PPG overnight) let it turn off normally again.
             // During position calibration keep it on until 2 min after the last hold, for the next tap.
-            val keepOn = (SensorLoggerService.rawMode &&
+            val keepOn = SensorLoggerService.mode == RecordingMode.PROBE ||
+                (SensorLoggerService.mode == RecordingMode.RAW &&
                 now - SensorLoggerService.startedAtMs < 20 * 60_000L) ||
                 now < SensorLoggerService.poseHoldUntilMs + 2 * 60_000L
             if (keepOn) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
             val ecgResult = SensorLoggerService.ecgResult
-            status.text = (if (ecgResult != null) "Ready\n$ecgResult" else "Ready") +
+            status.text = listOf("Ready", SensorLoggerService.recorderResult, ecgResult.orEmpty())
+                .filter { it.isNotEmpty() }.joinToString("\n") +
                 (if (SessionSync.status.isNotEmpty()) "\n${SessionSync.status}" else "")
             syncButton.visibility = View.VISIBLE
             syncButton.isEnabled = !SessionSync.running

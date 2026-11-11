@@ -9,24 +9,21 @@ import { clock, fmt } from "@/lib/utils";
 const SPAN = 10 * 60_000;
 const COLORS: string[] = ["var(--chart-6)", "var(--chart-1)", "var(--chart-6)", "var(--chart-2)", "var(--chart-3)", "var(--chart-5)", "var(--chart-5)"];
 
-type Role = "ambient" | "green" | "LED" | "—";
+type Role = "ambient" | "green (PW1)" | "LED" | "—";
 
-/** Ambient = LED off (0 mA) or DC near zero; green = the LED channel with the strongest pulse. */
+/** The optical colour assignments apply to the observed first-generation Pixel layouts. */
 function roles(c: LiveChannels): Role[] {
   const last = c.history[c.history.length - 1];
   const out: Role[] = [];
-  let best = -1, bestPi = 0;
-  for (let i = 0; i < 7; i++) {
-    if (i >= c.width || last.dc[i] == null) { out.push("—"); continue; }
+  for (let i = 0; i < c.width; i++) {
+    if (last.dc[i] == null) { out.push("—"); continue; }
     if (c.led[i] === 0 || last.pi[i] == null) { out.push("ambient"); continue; }
     out.push("LED");
-    if ((last.pi[i] ?? 0) > bestPi) { bestPi = last.pi[i]!; best = i; }
   }
   // green = last channel of the full configs (v6 in night mode, v5 in day mode, confirmed by the nights);
   // the strongest pulse is not reliable (v4 beat v6 on 2026-11-06). Off the wrist (1–2 LEDs) there is no green.
-  const g = c.width >= 7 ? 6 : c.width === 6 ? 5 : -1;
-  if (g >= 0 && out[g] === "LED") out[g] = "green";
-  void best;
+  const g = c.width === 7 ? 6 : c.width === 6 ? 5 : -1;
+  if (g >= 0 && out[g] === "LED") out[g] = "green (PW1)";
   return out;
 }
 
@@ -49,8 +46,8 @@ function Spark({ y, color }: { y: (number | null)[]; color: string }) {
 export function ChannelsCard({ c }: { c: LiveChannels }) {
   const h = c.history, last = h[h.length - 1], end = last.t;
   const rl = roles(c);
-  const col = (i: number): string => (rl[i] === "green" ? "var(--chart-4)" : COLORS[i]);
-  const led = rl.map((r, i) => (r === "LED" || r === "green" ? i : -1)).filter((i) => i >= 0);
+  const col = (i: number): string => (rl[i] === "green (PW1)" ? "var(--chart-4)" : COLORS[i % COLORS.length]);
+  const led = rl.map((r, i) => (r === "LED" || r === "green (PW1)" ? i : -1)).filter((i) => i >= 0);
   const recent = h.filter((p) => p.t >= end - SPAN);
   // DC relative to the first point in view (colour test: which channel drops on which paper)
   const base = led.map((i) => recent.find((p) => p.dc[i] != null && p.dc[i]! > 0)?.dc[i] ?? null);
@@ -62,8 +59,8 @@ export function ChannelsCard({ c }: { c: LiveChannels }) {
     });
     return o;
   });
-  const night = c.width >= 7;
-  const mode = night ? "night mode" : c.width === 6 ? "day mode" : "reduced (off wrist?)";
+  const night = c.width === 7;
+  const mode = night ? "PW1 night layout" : c.width === 6 ? "PW1 day layout" : "unmapped layout";
   const xAxis = <XAxis {...axis} dataKey="t" type="number" domain={[end - SPAN, end]} allowDataOverflow tickFormatter={(v: number) => clock(v).slice(0, 5)} />;
   const legend = led.map((i) => ({ label: `v${i}`, color: col(i), line: true }));
   return (

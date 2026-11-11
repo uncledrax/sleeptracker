@@ -8,9 +8,10 @@
  * and fetched again next time; it is never deleted.
  */
 import { spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, statSync, type WriteStream } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { digestDifferences, FILE_NAME, MANIFEST, parseManifest, SESSION_NAME, type Digests } from "./lib/manifest.ts";
 import { adb, findWatch, PKG } from "./lib/adb.ts";
 
 export interface RemoteSession { name: string; files: Record<string, number>; bytes: number; lastWrite: number; recording: boolean }
@@ -24,12 +25,13 @@ export function parseListing(text: string): RemoteSession[] {
     const m = l.match(/^(\d+) (\d+) ([^/]+)\/(.+)$/);
     if (!m) continue;
     const [, size, mtime, name, file] = m;
+    if (!SESSION_NAME.test(name) || !FILE_NAME.test(file) || file.endsWith(".part")) continue;
     const s = by.get(name) ?? { name, files: {}, bytes: 0, lastWrite: 0, recording: false };
     s.files[file] = Number(size); s.bytes += Number(size); s.lastWrite = Math.max(s.lastWrite, Number(mtime));
     by.set(name, s);
   }
-  // still recording = written to in the last 2 min (a night whose battery died has no "stop" but is finished)
-  for (const s of by.values()) s.recording = Number.isFinite(now) && now - s.lastWrite < 120;
+  // A recent write is a display hint for unsealed sessions. It never authorizes deletion.
+  for (const s of by.values()) s.recording = !(MANIFEST in s.files) && Number.isFinite(now) && now - s.lastWrite < 120;
   return [...by.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -45,30 +47,33 @@ export function differences(remote: RemoteSession, local: Record<string, number>
   return Object.keys(remote.files).filter((f) => local[f] !== remote.files[f]);
 }
 
-/**
- * Minimal streaming tar reader (ustar + GNU long names), enough for toybox `tar c`. Files are written to
- * `<name>.part` and renamed at the end, so an aborted transfer never leaves a truncated file under the real name.
- */
+/** Stage complete archive entries on the destination filesystem. Publishing happens after EOF,
+ * successful adb exit, and the caller's integrity checks. Existing analysis outputs are preserved. */
 export class TarExtract {
   private buf: Buffer = Buffer.alloc(0);
-  private out: WriteStream | null = null;
+  private fd: number | null = null;
   private left = 0;
   private pad = 0;
   private longName: string | null = null;
   private longBuf: Buffer[] | null = null;
-  private target = "";
-  private pending: Promise<void>[] = [];
+  private eof = false;
+  private readonly staging: string;
   files: string[] = [];
-  constructor(private root: string, private onFile?: (name: string, size: number) => void) {}
-
+  constructor(private root: string, private onFile?: (name: string, size: number) => void) {
+    mkdirSync(root, { recursive: true });
+    this.staging = mkdtempSync(join(root, ".pull-"));
+  }
   write(chunk: Buffer) {
     this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
     for (;;) {
       if (this.left > 0) {
         if (!this.buf.length) return;
-        const n = Math.min(this.left, this.buf.length);
-        const part = this.buf.subarray(0, n);
-        if (this.longBuf) this.longBuf.push(Buffer.from(part)); else this.out?.write(Buffer.from(part));
+        const n = Math.min(this.left, this.buf.length), part = this.buf.subarray(0, n);
+        if (this.longBuf) this.longBuf.push(Buffer.from(part));
+        else if (this.fd !== null) {
+          let off = 0;
+          while (off < n) off += writeSync(this.fd, part, off, n - off);
+        }
         this.buf = this.buf.subarray(n); this.left -= n;
         if (this.left === 0) this.finishEntry();
         continue;
@@ -82,9 +87,11 @@ export class TarExtract {
       if (this.buf.length < 512) return;
       const h = this.buf.subarray(0, 512);
       this.buf = this.buf.subarray(512);
-      if (h.every((b) => b === 0)) continue;             // end-of-archive blocks
+      if (h.every((b) => b === 0)) { this.eof = true; continue; }
+      if (this.eof) throw new Error("Unexpected data following tar terminator");
       const str = (a: number, b: number) => h.subarray(a, b).toString("utf8").replace(/\0.*$/s, "");
       const size = parseInt(str(124, 136).trim() || "0", 8);
+      if (!Number.isSafeInteger(size) || size < 0) throw new Error("Invalid tar length");
       const type = String.fromCharCode(h[156] || 48);
       const prefix = h.subarray(257, 263).toString("latin1").startsWith("ustar") ? str(345, 500) : "";
       let name = this.longName ?? (prefix ? `${prefix}/${str(0, 100)}` : str(0, 100));
@@ -93,30 +100,41 @@ export class TarExtract {
       this.left = size; this.pad = (512 - (size % 512)) % 512;
       if (type === "L") { this.longBuf = []; if (size === 0) this.finishEntry(); continue; }
       if (type === "0" || type === "\0" || type === "7") {
-        if (name.split("/").some((p) => p === "..") || name.startsWith("/")) throw new Error(`unsafe path in archive: ${name}`);
-        this.target = join(this.root, name);
-        mkdirSync(dirname(this.target), { recursive: true });
-        const out = createWriteStream(this.target + ".part");
-        this.out = out;
-        const target = this.target;
-        this.pending.push(new Promise((res, rej) => { out.on("finish", () => { renameSync(target + ".part", target); res(); }); out.on("error", rej); }));
+        const path = name.split("/");
+        if (path.length !== 2 || !SESSION_NAME.test(path[0]) || !FILE_NAME.test(path[1])) {
+          throw new Error(`Unexpected recording entry: ${name}`);
+        }
+        const target = join(this.staging, name);
+        mkdirSync(dirname(target), { recursive: true });
+        this.fd = openSync(target, "wx");
         this.files.push(name);
         this.onFile?.(name, size);
         if (size === 0) this.finishEntry();
-      } else if (type === "5") {
-        mkdirSync(join(this.root, name), { recursive: true });
-        this.left = 0; this.pad = 0;
       }
-      // other types (links etc.) are skipped: their data, if any, is consumed via left/pad with out = null
     }
   }
-
   private finishEntry() {
-    if (this.longBuf) { this.longName = Buffer.concat(this.longBuf).toString("utf8").replace(/\0.*$/s, ""); this.longBuf = null; return; }
-    this.out?.end(); this.out = null;
+    if (this.longBuf) { this.longName = Buffer.concat(this.longBuf).toString("utf8").replace(/\0.*$/s, ""); this.longBuf = null; }
+    if (this.fd !== null) { closeSync(this.fd); this.fd = null; }
   }
-
-  async end() { this.out?.end(); await Promise.all(this.pending); }
+  abort() {
+    if (this.fd !== null) { closeSync(this.fd); this.fd = null; }
+    rmSync(this.staging, { recursive: true, force: true });
+  }
+  async end(validate?: (stage: string) => Promise<void>) {
+    try {
+      if (!this.eof || this.left || this.pad || this.fd !== null || this.longName || this.buf.length) {
+        throw new Error("Incomplete ADB archive; prior local files retained");
+      }
+      await validate?.(this.staging);
+      // Install completion markers last. The entire transfer has already been validated.
+      for (const name of this.files.slice().sort((a, b) => Number(a.endsWith("/" + MANIFEST)) - Number(b.endsWith("/" + MANIFEST)))) {
+        const target = join(this.root, name);
+        mkdirSync(dirname(target), { recursive: true });
+        renameSync(join(this.staging, name), target);
+      }
+    } finally { this.abort(); }
+  }
 }
 
 function listRemote(serial: string): RemoteSession[] {
@@ -125,7 +143,7 @@ function listRemote(serial: string): RemoteSession[] {
   return parseListing(r.out);
 }
 
-function fetch(serial: string, names: string[], outDir: string): Promise<string[]> {
+function fetch(serial: string, names: string[], outDir: string, validate: (stage: string) => Promise<void>): Promise<string[]> {
   return new Promise((res, rej) => {
     const p = spawn("adb", ["-s", serial, "exec-out", `run-as ${PKG} tar c -C files/sessions ${names.join(" ")}`]);
     let got = 0, lastLog = 0;
@@ -140,12 +158,14 @@ function fetch(serial: string, names: string[], outDir: string): Promise<string[
     });
     let err = "";
     p.stderr.on("data", (c) => { err += c; });
-    p.on("error", rej);
+    p.on("error", e => { x.abort(); rej(e); });
     p.on("close", async (code) => {
       process.stdout.write(`\r  ${(got / 1e6).toFixed(0)} MB in ${((Date.now() - t0) / 1000).toFixed(0)} s\n`);
-      if (failed) return rej(failed);
-      try { await x.end(); } catch (e) { return rej(e); }
-      if (code !== 0) return rej(new Error(`adb exec-out ended with ${code}: ${err.trim()}`));
+      if (failed || code !== 0) {
+        x.abort();
+        return rej(failed ?? new Error(`adb exec-out ended with ${code}: ${err.trim()}`));
+      }
+      try { await x.end(validate); } catch (e) { return rej(e); }
       res(x.files);
     });
   });
@@ -163,35 +183,58 @@ async function main() {
   const remote = listRemote(serial);
   if (!remote.length) { console.log("No sessions on the watch."); return; }
 
-  const todo: RemoteSession[] = [];
   for (const s of remote) {
-    const diff = differences(s, localFiles(join(outDir, s.name)));
-    const state = s.recording ? "recording" : diff.length === 0 ? "complete locally" : existsSync(join(outDir, s.name)) ? `${diff.length} file(s) differ` : "new";
-    console.log(`  ${s.name}  ${mb(s.bytes).padStart(9)}  ${state}`);
-    if (diff.length) todo.push(s);
-  }
-  if (args.includes("--list")) return;
-
-  if (todo.length) {
-    console.log(`Fetching ${todo.length} session(s), ${mb(todo.reduce((a, s) => a + s.bytes, 0))} …`);
-    mkdirSync(outDir, { recursive: true });
-    await fetch(serial, todo.map((s) => s.name), outDir);
-  } else console.log("Nothing new.");
-
-  // check every fetched session against the watch's file sizes
-  const bad = todo.filter((s) => !s.recording && differences(s, localFiles(join(outDir, s.name))).length);
-  for (const s of bad) console.log(`  WARNING ${s.name}: sizes differ after the transfer: ${differences(s, localFiles(join(outDir, s.name))).join(", ")}`);
-  for (const s of todo.filter((x) => !bad.includes(x))) console.log(`  ok ${join(outDir, s.name)}`);
-
-  if (args.includes("--delete")) {
-    const del = remote.filter((s) => !s.recording && differences(s, localFiles(join(outDir, s.name))).length === 0);
-    if (!del.length) console.log("Nothing to delete on the watch.");
-    for (const s of del) {
-      const r = adb(["-s", serial, "shell", `run-as ${PKG} rm -r files/sessions/${s.name}`]);
-      console.log(`  ${r.ok ? "deleted on the watch" : "could NOT delete"} ${s.name}${r.ok ? "" : `: ${r.err.trim()}`}`);
+    const dir = join(outDir, s.name);
+    const finalized = MANIFEST in s.files;
+    console.log(`  ${s.name}  ${mb(s.bytes).padStart(9)}  ${finalized ? "sealed" : s.recording ? "recently active, copy only" : "unsealed, copy only"}`);
+    if (args.includes("--list")) continue;
+    let expected: Digests | null = null;
+    if (finalized) {
+      const manifest = adb(["-s", serial, "exec-out", `run-as ${PKG} cat files/sessions/${s.name}/${MANIFEST}`]);
+      if (!manifest.ok) throw new Error(`Cannot read manifest for ${s.name}`);
+      expected = parseManifest(manifest.out, s.name);
+      if (Object.keys(s.files).length !== Object.keys(expected).length ||
+          Object.entries(expected).some(([f, d]) => s.files[f] !== d.bytes)) {
+        throw new Error(`${s.name}: watch listing differs from its manifest; originals retained`);
+      }
     }
-  } else if (remote.some((s) => !s.recording)) console.log("Tip: --delete removes the sessions on the watch that are complete here.");
-  if (todo.some((s) => !s.recording)) console.log(`Next: npm run analyze -- ${join(outDir, todo.filter((s) => !s.recording).at(-1)!.name)}`);
+    const diff = expected ? await digestDifferences(dir, expected) : differences(s, localFiles(dir));
+    if (diff.length) {
+      // A closed session is fetched in full on repair, then verified before any existing files are replaced.
+      const files = Object.keys(s.files);
+      await fetch(serial, files.map(f => `${s.name}/${f}`), outDir, async stage => {
+        const incoming = join(stage, s.name);
+        if (expected) {
+          const bad = await digestDifferences(incoming, expected);
+          if (bad.length || JSON.parse(readFileSync(join(incoming, "session.json"), "utf8")).state !== "complete") {
+            throw new Error(`${s.name}: staged files failed verification (${bad.join(", ")}); originals retained`);
+          }
+        } else {
+          const sizes = localFiles(incoming), previous = localFiles(dir);
+          if (files.some(f => !(f in sizes) || sizes[f] < s.files[f] || sizes[f] < (previous[f] ?? 0))) {
+            throw new Error(`${s.name}: incomplete recording snapshot; existing copies retained`);
+          }
+        }
+      });
+      console.log(`  copied ${dir}`);
+    }
+    if (args.includes("--delete") && expected) {
+      if (JSON.parse(readFileSync(join(dir, "session.json"), "utf8")).state !== "complete" ||
+          (await digestDifferences(dir, expected)).length) throw new Error(`${s.name}: verification failed, retained`);
+      // Re-read every watch digest immediately before cleanup. Only immutable, sealed sessions reach here.
+      const hashes = adb(["-s", serial, "exec-out", `run-as ${PKG} sh -c 'cd files/sessions/${s.name} && sha256sum *'`], 600000);
+      const actual = new Map(hashes.out.trim().split(/\r?\n/).map(line => {
+        const m = line.match(/^([a-f0-9]{64})\s+([a-zA-Z0-9][a-zA-Z0-9_.-]*)$/);
+        return [m?.[2] ?? "", m?.[1] ?? ""] as const;
+      }));
+      if (!hashes.ok || actual.size !== Object.keys(expected).length || Object.entries(expected).some(([f, d]) => actual.get(f) !== d.sha256)) {
+        throw new Error(`${s.name}: watch no longer matches the verified archive; retained`);
+      }
+      const r = adb(["-s", serial, "shell", `run-as ${PKG} rm -r files/sessions/${s.name}`]);
+      if (!r.ok) throw new Error(`Watch cleanup failed: ${r.err.trim()}`);
+      console.log(`  verified and removed from the watch: ${s.name}`);
+    }
+  }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -17,9 +17,9 @@ import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "
 import { hrv, type Hrv } from "./lib/hrv.ts";
 import { basename, join } from "node:path";
 import { butterBandpass, findPeaks, sosfiltfilt } from "./lib/dsp.ts";
-import { f, hms, readEvents, writeCsv } from "./lib/io.ts";
+import { f, hms, sessionTimeZone, readEvents, writeCsv } from "./lib/io.ts";
 import { mean, median, std } from "./lib/stats.ts";
-import { analyse as analysePpg, bandpass as ppgBandpass, loadPpg, pickChannel } from "./ppg.ts";
+import { analyseRecording, loadPpg } from "./ppg.ts";
 
 const ECG_BAND: [number, number] = [0.5, 40];
 const RR_MIN = 300, RR_MAX = 2000;
@@ -208,6 +208,7 @@ export interface EcgReport {
   /** HRV of the whole test (ECG RR intervals); null without a usable ECG */
   hrv: Hrv | null;
   session: string;
+  timeZone: string;
   verdict: "no_file" | "blocked" | "constant" | "ecg" | "not_ecg";
   verdictText: string;
   lines: string[];
@@ -241,7 +242,7 @@ function candidates(r: RawFile, st: FileStats): Candidate[] {
 
 export function analyzeEcg(session: string): EcgReport {
   const rep: EcgReport = {
-    hrv: null, session: basename(session), verdict: "no_file", verdictText: "", lines: [], registration: [],
+    hrv: null, session: basename(session), timeZone: sessionTimeZone(session), verdict: "no_file", verdictText: "", lines: [], registration: [],
     ecg: null, lead: null, channels: [], best: null, snippet: null,
     rr: { t: [], rr: [] }, hrSensor: { t: [], bpm: [] }, ppg: null, leadSeries: { t: [], v: [] }, leadChanges: [],
   };
@@ -249,7 +250,7 @@ export function analyzeEcg(session: string): EcgReport {
   try {
     rep.registration = readEvents(session)
       .filter((e) => /^(raw |raw_missing|ecg_|no_heart)/.test(e.event))
-      .map((e) => `${hms(e.t)} ${e.event}`);
+      .map((e) => `${hms(e.t, rep.timeZone)} ${e.event}`);
   } catch { /* no events.csv */ }
 
   // what the app logged about the ECG sensor: missing from the sensor list, or registerListener() == false
@@ -341,14 +342,10 @@ export function analyzeEcg(session: string): EcgReport {
   // PPG beats as a second reference (same rules as ppg.ts, without motion mask: the test is done sitting still)
   if (existsSync(join(session, "raw_ppg.csv"))) {
     try {
-      const { t, ch } = loadPpg(session);
-      if (t.length > 100 * 10) {
-        const dts = Array.from(t.slice(1), (v, i) => v - t[i]);
-        const fs = 1000 / median(dts);
-        const still = new Uint8Array(t.length).fill(1);
-        const [c] = pickChannel(ch, fs, still);
-        if (c !== null) {
-          const { beats } = analysePpg(t, ppgBandpass(ch[c], fs), fs, new Uint8Array(t.length));
+      const optical = loadPpg(session);
+      if (optical.t.length) {
+        const { beats } = analyseRecording(optical, new Uint8Array(optical.t.length));
+        if (beats.t.length) {
           const ok = beats.t.map((_, i) => i).filter((i) => beats.clean[i]);
           const ibi = ok.map((i) => beats.ibi[i]);
           let ptt: number | null = null, matched = 0;
@@ -369,7 +366,7 @@ export function analyzeEcg(session: string): EcgReport {
   const head = [`ECG test ${rep.session}: ${rep.verdictText}`];
   if (rep.lead) {
     head.push(`Lead detector: ${rep.lead.events} events, ${rep.leadChanges.length} distinct states: ` +
-      rep.leadChanges.slice(0, 12).map((c) => `${hms(c.t)}=${c.value}`).join(", ") + (rep.leadChanges.length > 12 ? " …" : ""));
+      rep.leadChanges.slice(0, 12).map((c) => `${hms(c.t, rep.timeZone)}=${c.value}`).join(", ") + (rep.leadChanges.length > 12 ? " …" : ""));
   } else head.push("Lead detector: no data");
   if (rep.best?.hr != null) {
     const rr = rep.rr.rr.filter((v) => v >= RR_MIN && v <= RR_MAX);
@@ -421,7 +418,7 @@ export function reportSvg(r: EcgReport): string {
   let y = 0;
   if (r.snippet) {
     const a = r.snippet.t[0], b = r.snippet.t[r.snippet.t.length - 1];
-    parts.push(panel(y, h, w, `ECG raw (${r.best?.label}), 10 s from ${hms(a)}`, [{ t: r.snippet.t, v: r.snippet.raw, color: "#555" }], a, b)); y += h;
+    parts.push(panel(y, h, w, `ECG raw (${r.best?.label}), 10 s from ${hms(a, r.timeZone)}`, [{ t: r.snippet.t, v: r.snippet.raw, color: "#555" }], a, b)); y += h;
     const pk = r.snippet.peaks.map((p) => r.snippet!.filt[r.snippet!.t.findIndex((t) => t >= p)]);
     parts.push(panel(y, h, w, "filtered 0.5–40 Hz, dots = R peaks", [
       { t: r.snippet.t, v: r.snippet.filt, color: "#1f6feb" }, { t: r.snippet.peaks, v: pk, color: "#d1242f", dots: true }], a, b)); y += h;
@@ -486,7 +483,7 @@ function main() {
     const dir = args[hi + 1] ?? join("..", "sessions");
     const out = writeHrvHistory(dir);
     for (const r of hrvHistory(dir)) {
-      console.log(`${r.session}  ${hms(r.start)}  ${String(Math.round(r.durationS)).padStart(4)} s  HR ${f(r.hr ?? NaN, 1)}  RMSSD ${f(r.rmssd ?? NaN, 1)}  SDNN ${f(r.sdnn ?? NaN, 1)}  ES ${r.ectopic}  ${r.valid ? "" : "(" + r.note + ")"}`);
+      console.log(`${r.session}  ${hms(r.start, sessionTimeZone(join(dir, r.session)))}  ${String(Math.round(r.durationS)).padStart(4)} s  HR ${f(r.hr ?? NaN, 1)}  RMSSD ${f(r.rmssd ?? NaN, 1)}  SDNN ${f(r.sdnn ?? NaN, 1)}  ES ${r.ectopic}  ${r.valid ? "" : "(" + r.note + ")"}`);
     }
     console.log(`Table: ${out}`);
     return;

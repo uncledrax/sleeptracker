@@ -13,6 +13,7 @@ import { findWatch } from "./lib/adb.ts";
 import { isPrivate } from "./lib/sync_server.ts";
 import { hrv, type Hrv } from "./lib/hrv.ts";
 import { readEvents, readNumericCsv } from "./lib/io.ts";
+import { opticalSegments, successiveDifferences } from "./lib/ppg_segments.ts";
 import { mean, median, std } from "./lib/stats.ts";
 
 export const PPG_FS = 100, IMU_FS = 25, PPG_KEEP_S = 12, IMU_KEEP_S = 70, IBI_KEEP_S = 300;
@@ -53,12 +54,13 @@ export interface LiveChannels {
   /** [time, new width] whenever the number of values per line changes */
   modes: [number, number][];
 }
-const CH_MAX = 7, DC_MIN = 20000;   // ambient channels reach a few thousand when room light shines through a finger
+const DC_MIN = 20000;   // ambient channels reach a few thousand when room light shines through a finger
 
 /** Fixed-length ring buffer (like deque(maxlen)). */
 class Ring<T> {
   private a: T[] = [];
   constructor(private max: number) {}
+  clear() { this.a = []; }
   push(v: T) { this.a.push(v); if (this.a.length > this.max * 1.5) this.a = this.a.slice(-this.max); }
   get items(): T[] { if (this.a.length > this.max) this.a = this.a.slice(-this.max); return this.a; }
   get length() { return Math.min(this.a.length, this.max); }
@@ -72,8 +74,12 @@ export class State {
   ch: number;
   chQuality: Record<number, number> = {};
   chChecked = 0;
-  ppgT = new Ring<number>(PPG_KEEP_S * PPG_FS);
-  ppgY = new Ring<number[]>(PPG_KEEP_S * PPG_FS);
+  ppgT = new Ring<number>(PPG_KEEP_S * 1000);
+  ppgY = new Ring<number[]>(PPG_KEEP_S * 1000);
+  private opticalStart = -Infinity;
+  private lastOpticalTime = -Infinity;
+  private lastOpticalArrival = -Infinity;
+  private ppgHz = PPG_FS;
   sosPpg = butterBandpass(3, 0.6, 3.5, PPG_FS);
   sosBreath = butterBandpass(2, 0.1, 0.5, IMU_FS);
   ppgF: [number[], number[]] = [[], []];
@@ -122,17 +128,27 @@ export class State {
       this.counts.malformed = (this.counts.malformed ?? 0) + 1;
       this.error = `unreadable line (${why}): ${s.slice(0, 80)}`;
     };
-    if (parts.length < 3 || Number.isNaN(t)) return bad("format");
+    if (parts.length < 3 || !Number.isFinite(t)) return bad("format");
     this.lastRx = Date.now();
     this.lines++;
     this.trackClock(t);
     if (kind === "p") {
       this.lastP = s.slice(0, 160);
-      const vals = parts[2].trim().split(/\s+/).slice(0, 7).map(Number);
-      if (vals.some(Number.isNaN)) return bad("number");
+      const vals = parts[2].trim() ? parts[2].trim().split(/\s+/).map(Number) : [];
+      if (!vals.length || vals.some(v => !Number.isFinite(v)) || t <= this.lastOpticalTime) {
+        this.ppgT.clear(); this.ppgY.clear();
+        this.resetOptical(this.lastOpticalTime);
+        return bad("optical data or timestamp");
+      }
+      // A long interruption can lie completely outside the next processing window.
+      // Detect it as data arrives, before cropping (also works for a replay burst).
+      if (Number.isFinite(this.lastOpticalTime) && t - this.lastOpticalTime > 2500) {
+        this.ppgT.clear(); this.ppgY.clear();
+        this.resetOptical(t);
+      }
+      this.lastOpticalTime = t;
+      this.lastOpticalArrival = this.lastRx;
       if (vals.length <= this.ch) this.counts.p_too_short = (this.counts.p_too_short ?? 0) + 1;
-      if (vals.length !== this.width) { this.width = vals.length; this.modes.push([t, vals.length]); if (this.modes.length > 50) this.modes.shift(); }
-      while (vals.length < 7) vals.push(NaN);
       this.ppgT.push(t); this.ppgY.push(vals);
     } else if (kind === "a" || kind === "g") {
       const v = parts.slice(2, 5).map(Number);
@@ -231,13 +247,13 @@ export class State {
     let i0 = pt.length - 1;
     while (i0 > 0 && pt[i0 - 1] > tEnd - SPO2_WIN_S * 1000) i0--;
     const rows = raw.slice(i0);
-    if (rows.length < PPG_FS * (SPO2_WIN_S - 2)) return;
+    if (rows.length < this.ppgHz * (SPO2_WIN_S - 2)) return;
     const pi = (c: number): number | null => {
       const x = rows.map((r) => r[c]);
       if (x.some((v) => !Number.isFinite(v) || v <= 0)) return null;
       const m = mean(x);
       const y = sosfiltfilt(this.sosPpg, x.map((v) => v - m));
-      const s = Array.from(y.subarray(PPG_FS, y.length - PPG_FS)).sort((a, b) => a - b);   // filter edges out
+      const s = Array.from(y.subarray(this.ppgHz, y.length - this.ppgHz)).sort((a, b) => a - b);   // filter edges out
       return s.length ? (s[Math.floor(0.95 * (s.length - 1))] - s[Math.floor(0.05 * (s.length - 1))]) / m : null;
     };
     const [p1, p3, p4] = [pi(1), pi(3), pi(4)];
@@ -259,52 +275,90 @@ export class State {
     let i0 = pt.length - 1;
     while (i0 > 0 && pt[i0 - 1] > tEnd - SPO2_WIN_S * 1000) i0--;
     const rows = raw.slice(i0), ts = pt.slice(i0);
-    if (rows.length < PPG_FS * (SPO2_WIN_S - 2)) return;
+    if (rows.length < this.ppgHz * (SPO2_WIN_S - 2)) return;
     const n = Math.max(...rows.slice(-50).map((r) => r.filter(Number.isFinite).length));
     const dc: (number | null)[] = [], pi: (number | null)[] = [], tr: (number | null)[][] = [];
-    const step = 4, tt: number[] = [];
-    for (let i = PPG_FS; i < rows.length - PPG_FS; i += step) tt.push(ts[i]);
-    for (let c = 0; c < CH_MAX; c++) {
+    const step = Math.max(1, Math.round(this.ppgHz / 25)), tt: number[] = [];
+    for (let i = this.ppgHz; i < rows.length - this.ppgHz; i += step) tt.push(ts[i]);
+    for (let c = 0; c < this.width; c++) {
       const x = rows.map((r) => r[c]);
       if (x.some((v) => !Number.isFinite(v))) { dc.push(null); pi.push(null); tr.push([]); continue; }
       const m = mean(x);
       dc.push(Math.round(m));
       if (m < DC_MIN) { pi.push(null); tr.push([]); continue; }
       const y = sosfiltfilt(this.sosPpg, x.map((v) => v - m));
-      const inner = Array.from(y.subarray(PPG_FS, y.length - PPG_FS));
+      const inner = Array.from(y.subarray(this.ppgHz, y.length - this.ppgHz));
       const s = inner.slice().sort((a, b) => a - b);
       pi.push(s.length ? Math.round(((s[Math.floor(0.95 * (s.length - 1))] - s[Math.floor(0.05 * (s.length - 1))]) / m) * 1e6) / 1e4 : null);
       const yy: number[] = [];
-      for (let i = PPG_FS; i < rows.length - PPG_FS; i += step) yy.push(Math.round((y[i] / m) * 1e6) / 1e4);
+      for (let i = this.ppgHz; i < rows.length - this.ppgHz; i += step) yy.push(Math.round((y[i] / m) * 1e6) / 1e4);
       tr.push(yy);
     }
     this.chans.push({ t: tEnd, n, dc, pi });
     this.chTrace = { t: tt, y: tr };
   }
 
-  process() {
-    if (this.ecgT.length) this.processEcg();
-    let pt = this.ppgT.items.slice(), raw = this.ppgY.items.slice();
-    if (pt.length !== raw.length) { const n = Math.min(pt.length, raw.length); pt = pt.slice(-n); raw = raw.slice(-n); }
-    let sorted = true;
-    for (let i = 1; i < pt.length; i++) if (pt[i] < pt[i - 1]) { sorted = false; break; }
-    if (!sorted) {
-      const o = pt.map((_, i) => i).sort((a, b) => pt[a] - pt[b] || a - b);
-      pt = o.map((i) => pt[i]); raw = o.map((i) => raw[i]);
+  private resetOptical(start: number) {
+    this.opticalStart = start;
+    this.ppgF = [[], []]; this.beats.clear(); this.ibis.clear(); this.proms.clear();
+    this.chChecked = 0; this.chQuality = {};
+    this.chTrace = { t: [], y: [] };
+    this.chans.clear(); this.spo2.clear();
+    this.chansLast = 0; this.spo2Last = 0;
+  }
+
+  private processOptical() {
+    const times = this.ppgT.items;
+    if (times.length < 2) return;
+    const last = times[times.length - 1];
+    const keepFrom = times.findIndex(t => t >= last - PPG_KEEP_S * 1000);
+    const pt = times.slice(keepFrom), rows = this.ppgY.items.slice(keepFrom);
+    const parts = opticalSegments(pt, rows.map(r => r.length));
+    const part = parts[parts.length - 1];
+    if (part.reason !== "start" && pt[part.from] > this.opticalStart) this.resetOptical(pt[part.from]);
+    if (part.width !== this.width) {
+      if (this.width && this.beats.length) this.resetOptical(pt[part.from]);
+      this.width = part.width; this.modes.push([pt[part.from], this.width]);
+      if (this.modes.length > 50) this.modes.shift();
     }
-    if (pt.length > PPG_FS * SPO2_WIN_S) { this.processSpo2(pt, raw); this.processChannels(pt, raw); }
-    if (pt.length > PPG_FS * 3) {
-      if (this.fixedCh === null && Date.now() - this.chChecked > 5000) this.pickChannel(raw);
-      const keep = raw.map((r, i) => i).filter((i) => Number.isFinite(raw[i][this.ch]));
-      if (keep.length > PPG_FS * 3) {
-        const t = keep.map((i) => pt[i]);
-        const py = keep.map((i) => raw[i][this.ch]);
-        const m = mean(py);
-        const y = sosfiltfilt(this.sosPpg, py.map((v) => v - m));
-        this.ppgF = [t, Array.from(y)];
-        this.detectBeats(t, y);
+    const rate = Math.round(part.fs);
+    if (!Number.isFinite(rate) || rate <= 7) {
+      if (this.beats.length) this.resetOptical(last);
+      return;
+    }
+    if (rate !== this.ppgHz) {
+      if (Math.abs(rate / this.ppgHz - 1) > 0.25 && this.beats.length) this.resetOptical(pt[part.from]);
+      this.ppgHz = rate;
+      this.sosPpg = butterBandpass(3, 0.6, 3.5, rate);
+    }
+    const raw = rows.slice(part.from), t = pt.slice(part.from);
+    if (last - t[0] >= SPO2_WIN_S * 1000) { this.processSpo2(t, raw); this.processChannels(t, raw); }
+    if (last - t[0] < 3000) return;
+    if (this.fixedCh === null && Date.now() - this.chChecked > 5000) {
+      const old = this.ch;
+      this.pickChannel(raw);
+      if (this.ch !== old && this.beats.length) {
+        this.resetOptical(last);
+        return;
       }
     }
+    // A selected channel can disappear briefly even before a stable new layout is identified.
+    let first = raw.length;
+    while (first > 0 && Number.isFinite(raw[first - 1][this.ch]) && t[first - 1] >= this.opticalStart) first--;
+    if (first > 0 && !Number.isFinite(raw[first - 1][this.ch]) && t[first - 1] > this.opticalStart) {
+      this.resetOptical(t[first] ?? last);
+    }
+    if (raw.length - first <= this.ppgHz * 3) { this.ppgF = [[], []]; return; }
+    const x = raw.slice(first).map(r => r[this.ch]), m = mean(x);
+    const y = sosfiltfilt(this.sosPpg, x.map(v => v - m));
+    const pulseTimes = t.slice(first);
+    this.ppgF = [pulseTimes, Array.from(y)];
+    this.detectBeats(pulseTimes, y);
+  }
+
+  process() {
+    if (this.ecgT.length) this.processEcg();
+    this.processOptical();
     const acc = this.acc.items, gyro = this.gyro.items;
     if (acc.length > IMU_FS * 5) {
       const act = this.rollingStdLeft(acc);
@@ -325,17 +379,17 @@ export class State {
 
   private pickChannel(raw: number[][]) {
     this.chChecked = Date.now();
-    const seg = raw.slice(-8 * PPG_FS);
+    const seg = raw.slice(-8 * this.ppgHz);
     const q: Record<number, number> = {};
-    for (let c = 0; c < 7; c++) {
+    for (let c = 0; c < this.width; c++) {
       const x = seg.map((r) => r[c]);
       if (x.some((v) => !Number.isFinite(v) || v < 0) || std(x, 0) < 1e-6) continue;
       const m = mean(x);
       const fl = sosfiltfilt(this.sosPpg, x.map((v) => v - m));
       const fm = mean(fl), fsd = std(fl, 0) + 1e-12;
-      const ac = autocorr(fl.map((v) => (v - fm) / fsd), Math.trunc(1.5 * PPG_FS));
+      const ac = autocorr(fl.map((v) => (v - fm) / fsd), Math.trunc(1.5 * this.ppgHz));
       let best = -Infinity;
-      for (let k = Math.trunc(0.33 * PPG_FS); k < Math.trunc(1.5 * PPG_FS); k++) best = Math.max(best, ac[k]);
+      for (let k = Math.trunc(0.33 * this.ppgHz); k < Math.trunc(1.5 * this.ppgHz); k++) best = Math.max(best, ac[k]);
       q[c] = Math.round(best * 100) / 100;
     }
     this.chQuality = q;
@@ -358,7 +412,7 @@ export class State {
     const recent: number[] = [];
     for (let i = 0; i < pt.length; i++) if (pt[i] > tEnd - 2500) recent.push(Math.abs(py[i]));
     const amp = median(recent) + 1e-9;
-    let { peaks } = findPeaks(py, { distance: Math.trunc(0.33 * PPG_FS), prominence: 0.8 * amp });
+    let { peaks } = findPeaks(py, { distance: Math.trunc(0.33 * this.ppgHz), prominence: 0.8 * amp });
     peaks = peaks.filter((p) => pt[p] > pt[0] + 1000);
     const mov = this.movingTimes();
     let last = this.beats.last() ?? -1;
@@ -432,20 +486,23 @@ export class State {
   snapshot() {
     const ppgT = this.ppgT.items, acc = this.acc.items;
     const now = ppgT.length ? ppgT[ppgT.length - 1] : acc.length ? acc[acc.length - 1][0] : 0;
-    const [pt, py] = this.ppgF;
-    const k = Math.max(1, Math.floor(pt.length / 600));
-    const ibis = this.ibis.items.filter((x) => x[0] > now - IBI_KEEP_S * 1000);
-    const clean = ibis.filter(([t, , fl]) => fl === "" && t > now - 60000).map((x) => x[1]);
-    let d = clean.length > 2 ? clean.slice(1).map((v, i) => v - clean[i]) : [];
-    const med = clean.length ? median(clean) : null;
-    if (med) d = d.filter((v) => Math.abs(v) < 0.2 * med);
-    const hrLast = this.hr.last();
     const wall = Date.now();
+    const opticalFresh = wall - this.lastOpticalArrival < 3000;
+    const [pt, py] = opticalFresh ? this.ppgF : [[], []];
+    const k = Math.max(1, Math.floor(pt.length / 600));
+    const ibis = opticalFresh ? this.ibis.items.filter((x) => x[0] > now - IBI_KEEP_S * 1000) : [];
+    const recent = ibis.filter(x => x[0] > now - 60000);
+    const clean = recent.filter(x => !x[2]).map(x => x[1]);
+    const differences = successiveDifferences(recent.length, i => recent[i][1], i => !recent[i][2],
+      i => Math.abs(recent[i][0] - recent[i][1] - recent[i - 1][0]) < 0.01);
+    const med = clean.length ? median(clean) : null;
+    const d = med ? differences.filter(v => Math.abs(v) < 0.2 * med) : differences;
+    const hrLast = this.hr.last();
     const yf = py.length ? py : [0];
     const round1 = (v: number) => Math.round(v * 10) / 10;
     return {
       diag: {
-        ch: this.ch, auto: this.fixedCh === null, quality: this.chQuality, ppg_n: ppgT.length,
+        ch: this.ch, auto: this.fixedCh === null, quality: this.chQuality, ppg_fresh: opticalFresh, ppg_hz: this.ppgHz, ppg_n: ppgT.length,
         ppg_span_s: ppgT.length > 1 ? round1((ppgT[ppgT.length - 1] - ppgT[0]) / 1000) : 0,
         lag_ppg_s: ppgT.length ? round1((wall - ppgT[ppgT.length - 1]) / 1000) : null,
         lag_acc_s: acc.length ? round1((wall - acc[acc.length - 1][0]) / 1000) : null,
@@ -468,9 +525,9 @@ export class State {
           events: this.counts.c ?? 0, lead: this.lead, ...((rr) => ({ rr, hrv: rr.rr.length >= 11 ? hrv(rr.rr.slice(1)) : null }))(this.ecgRr()) } satisfies LiveEcg)
         : null,
       clock_offset_ms: this.clockOffsetMs,
-      spo2: this.spo2.items,
+      spo2: opticalFresh ? this.spo2.items : [],
       oximeter: this.oximeter.items,
-      channels: this.chans.length
+      channels: opticalFresh && this.chans.length
         ? ({ width: this.width, history: this.chans.items, trace: this.chTrace, led: { ...this.led }, modes: this.modes } satisfies LiveChannels)
         : null,
       numbers: {

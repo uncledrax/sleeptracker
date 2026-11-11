@@ -14,7 +14,7 @@ import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { load as loadSession, movementEvents, resample, type MoveEvent } from "./analyze.ts";
-import { argValue, berlinToEpoch, f, hm, hms, readEvents, readNumericCsv, sortBy, writeCsv } from "./lib/io.ts";
+import { argValue, sessionTimeZone, timestampToEpoch, f, hm, hms, readEvents, readNumericCsv, sortBy, writeCsv } from "./lib/io.ts";
 import { mean, median, std } from "./lib/stats.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -136,7 +136,7 @@ function cmdCalibrate(sessions: string[], modelPath: string, wrist: string) {
   const have = new Set(model.templates.map(key));
   for (const s of sessions) {
     const { templates, rejected } = watchTemplates(s);
-    for (const [lab, ms, why] of rejected) console.log(`  ${basename(s)} ${hms(ms)} ${lab}: discarded, ${why}`);
+    for (const [lab, ms, why] of rejected) console.log(`  ${basename(s)} ${hms(ms, sessionTimeZone(s))} ${lab}: discarded, ${why}`);
     const added = templates.filter((t) => !have.has(key(t)));
     model.templates.push(...added);
     console.log(`${basename(s)}: ${added.length} new templates`);
@@ -259,9 +259,10 @@ function positionStats(session: string, seg: Segment[]): string[] {
     return lines;
   }
   const pmCsv = readCsv(pmPath);
+  const zone = sessionTimeZone(session);
   const col = (name: string) => pmCsv.header.indexOf(name);
   const pos = perMinutePositions(seg.filter((s) => !s.uncertain));
-  const pm = pmCsv.rows.map((r) => ({ r, position: pos.get(berlinToEpochOffset(r[0])) }))
+  const pm = pmCsv.rows.map((r) => ({ r, position: pos.get(timestampToEpoch(r[0], zone)) }))
     .filter((x): x is { r: string[]; position: string } => x.position !== undefined);
   const numCol = (rows: string[][], name: string) => rows.map((r) => (r[col(name)] === "" ? NaN : Number(r[col(name)])));
   lines.push("", "Per position (uncertain segments left out):");
@@ -299,14 +300,6 @@ function positionStats(session: string, seg: Segment[]): string[] {
   return lines;
 }
 
-/** "2026-11-03 23:06:00+01:00" -> epoch ms (offset given explicitly). */
-function berlinToEpochOffset(s: string): number {
-  const m = s.match(/([+-])(\d\d):(\d\d)$/);
-  if (!m) return berlinToEpoch(s);
-  const naive = Date.parse(s.slice(0, 19).replace(" ", "T") + "Z");
-  return naive - (m[1] === "-" ? -1 : 1) * (+m[2] * 60 + +m[3]) * 60000;
-}
-
 const SEG_COLS = ["start_ms", "end_ms", "x", "y", "z", "position", "angle_deg", "margin_deg", "uncertain", "minutes"] as const;
 
 function cmdClassify(session: string, modelPath: string, plot: boolean) {
@@ -317,7 +310,7 @@ function cmdClassify(session: string, modelPath: string, plot: boolean) {
   console.log(text);
   writeFileSync(join(session, "position_summary.txt"), text + "\n", "utf8");
   writeCsv(join(session, "positions.csv"), [...SEG_COLS], seg.map((s) => SEG_COLS.map((c) => s[c])));
-  if (plot) plotPositions(join(session, "positions.svg"), [["watch", seg]]);
+  if (plot) plotPositions(join(session, "positions.svg"), [["watch", seg]], sessionTimeZone(session));
 }
 
 // ---------------------------------------------------------------- phone reference
@@ -482,7 +475,7 @@ function cmdValidate(session: string, phonePath: string, modelPath: string, offs
   writeFileSync(join(session, "position_validation.txt"), text + "\n", "utf8");
   if (plot) {
     const trk = mid.map((m, i) => ({ start_ms: m - EPOCH_S * 500, end_ms: m + EPOCH_S * 500, position: truth[i] ?? "unknown", uncertain: false }));
-    plotPositions(join(session, "position_validation.svg"), [["watch", seg], ["phone (torso)", trk]]);
+    plotPositions(join(session, "position_validation.svg"), [["watch", seg], ["phone (torso)", trk]], sessionTimeZone(session));
   }
 }
 
@@ -491,7 +484,7 @@ function cmdValidate(session: string, phonePath: string, modelPath: string, offs
 const COLORS: Record<string, string> = { back: "#d62728", left: "#1f77b4", right: "#2ca02c", stomach: "#9467bd", unknown: "#d3d3d3", upright: "#000000" };
 type Track = [string, { start_ms: number; end_ms: number; position: string; uncertain: boolean }[]];
 
-function plotPositions(out: string, tracks: Track[]) {
+function plotPositions(out: string, tracks: Track[], zone: string) {
   const all = tracks.flatMap(([, s]) => s);
   if (!all.length) { console.log("Plot: nothing to draw"); return; }
   const a = Math.min(...all.map((s) => s.start_ms)), b = Math.max(...all.map((s) => s.end_ms));
@@ -509,7 +502,7 @@ function plotPositions(out: string, tracks: Track[]) {
   const axisY = top + tracks.length * rowH + 4;
   p.push(`<line x1="${L}" x2="${W - R}" y1="${axisY}" y2="${axisY}" stroke="#333"/>`);
   for (let t = Math.ceil(a / 3.6e6) * 3.6e6; t <= b; t += 3.6e6) {
-    p.push(`<line x1="${x(t)}" x2="${x(t)}" y1="${axisY}" y2="${axisY + 5}" stroke="#333"/><text x="${x(t)}" y="${axisY + 18}" text-anchor="middle" font-size="11">${hm(t)}</text>`);
+    p.push(`<line x1="${x(t)}" x2="${x(t)}" y1="${axisY}" y2="${axisY + 5}" stroke="#333"/><text x="${x(t)}" y="${axisY + 18}" text-anchor="middle" font-size="11">${hm(t, zone)}</text>`);
   }
   Object.entries(COLORS).forEach(([lab, c], i) => {
     const lx = L + i * 110;

@@ -36,3 +36,20 @@ test("TarExtract restores files byte for byte, also in small chunks and with lon
   assert.equal(readFileSync(join(dst, "20261101_220000", long), "utf8"), "a,b\n");
   assert.equal(readFileSync(join(dst, "20261101_220000", "empty.csv"), "utf8"), "");
 });
+
+test("an interrupted ADB replacement preserves both files; a retry replaces both", async () => {
+  const src = mkdtempSync(join(tmpdir(), "partial-src-")), dst = mkdtempSync(join(tmpdir(), "partial-dst-"));
+  const session = "20261111_230000", names = ["a.csv", "b.csv"];
+  mkdirSync(join(src, session)); mkdirSync(join(dst, session));
+  for (const name of names) {
+    writeFileSync(join(src, session, name), Buffer.alloc(2048, 82));
+    writeFileSync(join(dst, session, name), "previous good local copy");
+  }
+  const tar = execFileSync("tar", ["c", "-C", src, ...names.map(name => session + "/" + name)]);
+  const transfer = new TarExtract(dst);
+  transfer.write(tar.subarray(0, 512 + 2048 + 512 + 256));
+  await assert.rejects(transfer.end(), /Incomplete/);
+  for (const name of names) assert.equal(readFileSync(join(dst, session, name), "utf8"), "previous good local copy");
+  const retry = new TarExtract(dst); retry.write(tar); await retry.end();
+  for (const name of names) assert.deepEqual(readFileSync(join(dst, session, name)), Buffer.alloc(2048, 82));
+});

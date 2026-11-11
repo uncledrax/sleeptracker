@@ -5,7 +5,7 @@
  */
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
-import { berlinToEpoch, f } from "./lib/io.ts";
+import { timestampToEpoch, f } from "./lib/io.ts";
 import { corr, max, mean, median, min, std } from "./lib/stats.ts";
 
 export const LOW_SPO2 = 90;
@@ -42,30 +42,31 @@ export function findExport(session: string, explicit?: string): { data: Json; pa
 }
 
 /** Average values per local minute, key = epoch ms of the minute. */
-function perMinute(rows: Json[] | undefined, col: string): Map<number, number> {
+function perMinute(rows: Json[] | undefined, col: string, zone?: string): Map<number, number> {
   const acc = new Map<number, number[]>();
   for (const r of rows ?? []) {
-    const t = berlinToEpoch(r.time);
-    if (Number.isNaN(t)) continue;
+    const t = timestampToEpoch(r.time, zone);
+    const value = r[col];
+    if (!Number.isFinite(t) || value == null || value === "" || !Number.isFinite(Number(value))) continue;
     const m = Math.floor(t / MIN) * MIN;
     if (!acc.has(m)) acc.set(m, []);
-    acc.get(m)!.push(Number(r[col]));
+    acc.get(m)!.push(Number(value));
   }
   return new Map([...acc.entries()].sort((a, b) => a[0] - b[0]).map(([k, v]) => [k, mean(v)]));
 }
 
-export function load(data: Json): Fb {
+export function load(data: Json, zone?: string): Fb {
   const fb = data.fitbit;
   const sleep = fb.sleep ?? {};
   const stages = (sleep.timeline ?? []).map((r: Json) => {
-    const start = berlinToEpoch(r.start);
+    const start = timestampToEpoch(r.start, zone);
     return { start, end: start + r.minutes * MIN, level: r.level };
-  });
+  }).filter((r: { start: number; end: number }) => Number.isFinite(r.start) && r.end > r.start);
   return {
     vitals: fb.vitals ?? {}, sleep, stages,
-    hr: perMinute(fb.heartRatePerMinute, "bpm"),
-    spo2: perMinute(fb.spo2PerMinute, "value"),
-    hrv: perMinute(fb.hrvPer5Minutes, "value"),
+    hr: perMinute(fb.heartRatePerMinute, "bpm", zone),
+    spo2: perMinute(fb.spo2PerMinute, "value", zone),
+    hrv: perMinute(fb.hrvPer5Minutes, "value", zone),
     room: (data.tado ?? {}).readings ?? [],
   };
 }
@@ -130,6 +131,7 @@ export function annotate(minutes: Minute[], fb: Fb, pose: ReturnType<typeof wris
 
 export interface Episode {
   start: number; end: number; minutes: number; spo2_min: number; spo2_mean: number; max_pose_change_deg: number;
+  pattern: "sustained" | "intermittent"; longest_run_minutes: number;
   ends_with_movement: boolean; hr_rise_bpm: number; stage: string | null; verdict: string;
 }
 
@@ -144,20 +146,27 @@ export function lowSpo2Episodes(m: Minute[], moveStarts: number[]): Episode[] {
   groups.push(cur);
   return groups.filter((g) => g.length >= LOW_SPO2_MIN_MINUTES).map((ep) => {
     const a = ep[0], b = ep[ep.length - 1] + MIN;
-    const seg = m.filter((r) => r.minute >= a && r.minute <= b - MIN);
+    let longestRun = 1, run = 1;
+    for (let i = 1; i < ep.length; i++) {
+      run = ep[i] - ep[i - 1] === MIN ? run + 1 : 1;
+      longestRun = Math.max(longestRun, run);
+    }
+    const pattern = ep.length * MIN === b - a ? "sustained" : "intermittent";
+    const seg = m.filter((r) => r.minute >= a && r.minute < b);
     const core = seg.length > 4 ? seg.slice(0, -2) : seg;
     const pc = core.length > 1 ? max(core.slice(1).map((r) => r.pose_change_deg ?? NaN)) : 0;
     const endsWithMove = moveStarts.some((t) => t >= b - 3 * MIN && t <= b + 2 * MIN);
     const hrRise = max(core.map((r) => r.hr_max)) - median(core.map((r) => r.hr_mean));
     const still = !Number.isNaN(pc) && pc < POSE_STILL_DEG;   // like Python: (nan or 0) < 10 is False
-    const verdict = still && endsWithMove && (Number.isNaN(hrRise) || hrRise < 10)
+    const verdict = !Number.isFinite(hrRise) ? "insufficient HR data"
+      : still && endsWithMove && hrRise < 10
       ? "probably a pose artifact (arm still, ends with movement, heart rate calm)" : "unclear";
     const stages = seg.map((r) => r.stage).filter((s): s is string => !!s);
     const counts = new Map<string, number>();
     for (const s of stages) counts.set(s, (counts.get(s) ?? 0) + 1);
     const stage = stages.length ? [...counts.entries()].sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))[0][0] : null;
     const sp = seg.map((r) => r.spo2 ?? NaN);
-    return { start: a, end: b, minutes: ep.length, spo2_min: min(sp), spo2_mean: mean(sp), max_pose_change_deg: pc,
+    return { start: a, end: b, minutes: ep.length, pattern, longest_run_minutes: longestRun, spo2_min: min(sp), spo2_mean: mean(sp), max_pose_change_deg: pc,
       ends_with_movement: endsWithMove, hr_rise_bpm: hrRise, stage, verdict };
   });
 }

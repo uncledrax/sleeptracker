@@ -20,7 +20,6 @@ import pandas as pd
 import fitbit as F
 
 MIN_QUALITY = 0.4
-TZ = F.TZ
 
 
 def read_notes(session: Path):
@@ -46,11 +45,12 @@ def battery_rate(session: Path):
 
 
 def night_row(session: Path):
+    zone = F.session_zone(session)
     m = pd.read_csv(session / "per_minute.csv", parse_dates=["minute"]).set_index("minute")
-    m.index = pd.to_datetime(m.index, utc=True).tz_convert(TZ)
+    m.index = pd.to_datetime(m.index, utc=True).tz_convert(zone)
     br = pd.read_csv(session / "breathing.csv")
     br = br[br.quality >= MIN_QUALITY].copy()
-    br["t"] = pd.to_datetime(br.epoch_ms, unit="ms", utc=True).dt.tz_convert(TZ)
+    br["t"] = pd.to_datetime(br.epoch_ms, unit="ms", utc=True).dt.tz_convert(zone)
     mv = pd.read_csv(session / "movement_events.csv")
     hours = len(m) / 60
 
@@ -61,7 +61,7 @@ def night_row(session: Path):
     data, _ = F.find_export(session)
     asleep = m
     if data:
-        fb = F.load(data)
+        fb = F.load(data, zone)
         sl, v = fb["sleep"], fb["vitals"]
         day = data["fitbit"].get("dayBefore") or {}
         r.update({"sleep_min": sl.get("minutesAsleep"), "efficiency": sl.get("efficiency"),

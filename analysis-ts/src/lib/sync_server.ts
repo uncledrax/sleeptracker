@@ -7,13 +7,17 @@
  * Only clients from private networks (home Wi-Fi) are accepted.
  */
 import { createSocket } from "node:dgram";
+import { createHash, randomUUID } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { digestFile, SESSION_NAME, FILE_NAME, SHA256 } from "./manifest.ts";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
 export const DISCOVERY_PORT = 9001, SYNC_PORT = 9002;
-const SESSION = /^\d{8}_\d{6}$/, FILE = /^[\w.-]+$/;
+
 
 /** loopback, RFC 1918, link-local, CGNAT (also IPv4-mapped IPv6) */
 export function isPrivate(addr: string | undefined): boolean {
@@ -44,48 +48,75 @@ function localFiles(dir: string): Record<string, number> {
   const out: Record<string, number> = {};
   if (!existsSync(dir)) return out;
   for (const f of readdirSync(dir)) {
-    if (f.endsWith(".part")) continue;
+    if (!FILE_NAME.test(f) || f.endsWith(".part")) continue;
     const st = statSync(join(dir, f));
     if (st.isFile()) out[f] = st.size;
   }
   return out;
 }
 
+export function syncHandler(sessionsDir: string, log: (s: string) => void) {
+  const send = (res: ServerResponse, code: number, body: unknown) => {
+    if (res.destroyed || res.headersSent) return;
+    res.writeHead(code, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    try {
+      if (!isPrivate(req.socket.remoteAddress)) return send(res, 403, { error: "private networks only" });
+      const url = new URL(req.url ?? "/", "http://localhost");
+      const parts = decodeURIComponent(url.pathname).split("/").filter(Boolean);
+      if (parts[0] !== "sessions" || !SESSION_NAME.test(parts[1] ?? "")) return send(res, 404, { error: "not found" });
+      const dir = join(sessionsDir, parts[1]);
+      if (req.method === "GET" && parts.length === 2) {
+        const files = localFiles(dir);
+        if (url.searchParams.get("hashes") !== "1") return send(res, 200, { files });
+        const sha256: Record<string, string> = {};
+        for (const name of Object.keys(files)) {
+          const digest = await digestFile(join(dir, name));
+          sha256[name] = digest.sha256;
+          files[name] = digest.bytes;
+        }
+        return send(res, 200, { files, sha256 });
+      }
+      if (req.method !== "PUT" || parts.length !== 3 || !FILE_NAME.test(parts[2]) || parts[2].endsWith(".part")) {
+        return send(res, 405, { error: "method not allowed" });
+      }
+      const length = Number(req.headers["content-length"]);
+      if (!Number.isSafeInteger(length) || length < 0) return send(res, 411, { error: "Content-Length required" });
+      const expected = req.headers["x-content-sha256"];
+      if (expected !== undefined && (typeof expected !== "string" || !SHA256.test(expected))) {
+        return send(res, 400, { error: "Invalid SHA-256 digest" });
+      }
+      mkdirSync(dir, { recursive: true });
+      const target = join(dir, parts[2]), tmp = join(dir, `.${randomUUID()}.part`);
+      const hash = createHash("sha256");
+      let bytes = 0;
+      try {
+        const meter = new Transform({ transform(chunk: Buffer, _enc, cb) {
+          hash.update(chunk); bytes += chunk.length; cb(null, chunk);
+        } });
+        await pipeline(req, meter, createWriteStream(tmp, { flags: "wx", flush: true }));
+        const sha256 = hash.digest("hex");
+        if (bytes !== length || (expected && expected !== sha256)) {
+          return send(res, 400, { error: "Recording size or SHA-256 mismatch" });
+        }
+        renameSync(tmp, target);
+        log(`sync: ${parts[1]}/${parts[2]} ${(bytes / 1e6).toFixed(1)} MB`);
+        send(res, 200, { size: bytes, sha256 });
+      } finally { rmSync(tmp, { force: true }); }
+    } catch (e) {
+      const error = (e as Error).message;
+      log(`sync failed: ${error}`);
+      send(res, 400, { error });
+    }
+  };
+}
+
 export function startSyncServer(o: SyncOptions) {
   const log = o.log ?? console.log;
   const syncPort = o.syncPort ?? SYNC_PORT;
-  const got = new Map<string, number>();   // bytes received per session in this run (for the log)
-  const send = (res: ServerResponse, code: number, body: unknown) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(body)); };
-  const srv = createServer((req: IncomingMessage, res: ServerResponse) => {
-    if (!isPrivate(req.socket.remoteAddress)) return send(res, 403, { error: "private networks only" });
-    const parts = decodeURIComponent((req.url ?? "").split("?")[0]).split("/").filter(Boolean);
-    if (parts[0] !== "sessions" || !parts[1] || !SESSION.test(parts[1])) return send(res, 404, { error: "not found" });
-    const dir = join(o.sessionsDir, parts[1]);
-    if (req.method === "GET" && parts.length === 2) return send(res, 200, { files: localFiles(dir) });
-    if (req.method === "PUT" && parts.length === 3 && FILE.test(parts[2])) {
-      const len = Number(req.headers["content-length"]);
-      if (!Number.isFinite(len)) return send(res, 411, { error: "Content-Length required" });
-      mkdirSync(dir, { recursive: true });
-      const target = join(dir, parts[2]), part = target + ".part";
-      const out = createWriteStream(part);
-      let n = 0;
-      req.on("data", (c: Buffer) => { n += c.length; });
-      req.pipe(out);
-      const fail = (why: string) => { try { rmSync(part, { force: true }); } catch { /* */ } if (!res.headersSent) send(res, 400, { error: why }); };
-      req.on("aborted", () => fail("aborted"));
-      out.on("error", (e) => fail(e.message));
-      out.on("finish", () => {
-        if (n !== len) return fail(`got ${n} of ${len} bytes`);
-        renameSync(part, target);
-        const total = (got.get(parts[1]) ?? 0) + n;
-        got.set(parts[1], total);
-        log(`sync: ${parts[1]}/${parts[2]} ${(n / 1e6).toFixed(1)} MB (session so far ${(total / 1e6).toFixed(1)} MB)`);
-        send(res, 200, { size: n });
-      });
-      return;
-    }
-    send(res, 405, { error: "method not allowed" });
-  });
+  const srv = createServer(syncHandler(o.sessionsDir, log));
   srv.requestTimeout = 0;   // a night of PPG takes minutes over the watch's Wi-Fi
   srv.on("error", (e) => log(`sync HTTP ${syncPort}: ${e.message}`));
   srv.listen(syncPort, "0.0.0.0");

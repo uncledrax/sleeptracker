@@ -11,7 +11,7 @@
 import { existsSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { autocorr, butterBandpass, findPeaks, principalComponent, sosfiltfilt } from "./lib/dsp.ts";
-import { argValue, f, hm, isoLocal, readEvents, readNumericCsv, sortBy, writeCsv } from "./lib/io.ts";
+import { argValue, f, hm, isoLocal, sessionTimeZone, readEvents, readNumericCsv, sortBy, writeCsv } from "./lib/io.ts";
 import { interp, max, mean, median, min, rollingMedian, rollingStd, std } from "./lib/stats.ts";
 import * as F from "./fitbit.ts";
 
@@ -250,9 +250,10 @@ function perMinute(grid: Float64Array, activity: Float64Array, events: MoveEvent
 
 function main() {
   const args = process.argv.slice(2);
-  const session = args.find((a, i) => !a.startsWith("--") && !["--fitbit", "--fs"].includes(args[i - 1]));
-  if (!session) { console.error("Usage: tsx src/analyze.ts <session> [--fitbit file]"); process.exit(2); }
+  const session = args.find((a, i) => !a.startsWith("--") && !["--fitbit", "--fs", "--time-zone"].includes(args[i - 1]));
+  if (!session) { console.error("Usage: tsx src/analyze.ts <session> [--fitbit file] [--time-zone IANA-name]"); process.exit(2); }
   const fs = Number(argValue(args, "--fs") ?? 25);
+  const zone = sessionTimeZone(session, argValue(args, "--time-zone"));
 
   const { acc, gyro, hr } = load(session);
   const step = 1000 / fs;
@@ -271,7 +272,7 @@ function main() {
   let fb: F.Fb | null = null, spo2Eps: F.Episode[] | null = null;
   const moveStarts = events.map((e) => e.start_ms);
   if (exp) {
-    fb = F.load(exp.data);
+    fb = F.load(exp.data, zone);
     minutes = F.annotate(minutes, fb, F.wristPose(acc as { epoch_ms: Float64Array; x: Float64Array; y: Float64Array; z: Float64Array }));
     spo2Eps = F.lowSpo2Episodes(minutes, moveStarts);
   }
@@ -305,7 +306,7 @@ function main() {
   if (fb && exp) {
     lines.push(`(Fitbit export: ${basename(exp.path)})`, ...F.summaryLines(fb, minutes, breath, moveStarts, BREATH_MIN_QUALITY).slice(1));
     for (const e of spo2Eps ?? []) {
-      lines.push(`  SpO2 < ${F.LOW_SPO2} %: ${hm(e.start)}–${hm(e.end)} (${e.minutes} min, min ${f(e.spo2_min, 1)} %, `
+      lines.push(`  SpO2 < ${F.LOW_SPO2} %: ${hm(e.start, zone)}–${hm(e.end, zone)} (${e.pattern}, ${e.minutes} low min, longest run ${e.longest_run_minutes} min, min ${f(e.spo2_min, 1)} %, `
         + `arm pose ±${f(e.max_pose_change_deg)}°, stage ${e.stage ?? "None"}) → ${e.verdict}`);
     }
     if (spo2Eps?.length) lines.push("  Note: watch SpO2 at the wrist is error-prone. If this repeats, check with a finger pulse oximeter.");
@@ -324,10 +325,10 @@ function main() {
   const mCols = ["activity_mean", "movement_events", "hr_mean", "hr_min", "hr_max", "breaths_per_min", "cvhr_episode",
     ...(fb ? ["stage", "fitbit_hr", "spo2", "hrv", "x", "y", "z", "pose_change_deg"] : [])];
   writeCsv(join(session, "per_minute.csv"), ["minute", ...mCols],
-    minutes.map((m) => [isoLocal(m.minute), ...mCols.map((c) => (m as unknown as Record<string, number | string | boolean>)[c])]));
+    minutes.map((m) => [isoLocal(m.minute, zone), ...mCols.map((c) => (m as unknown as Record<string, number | string | boolean>)[c])]));
   if (spo2Eps) {
-    writeCsv(join(session, "spo2_episodes.csv"), ["start", "end", "minutes", "spo2_min", "spo2_mean", "max_pose_change_deg", "ends_with_movement", "hr_rise_bpm", "stage", "verdict"],
-      spo2Eps.map((e) => [isoLocal(e.start), isoLocal(e.end), e.minutes, e.spo2_min, e.spo2_mean, e.max_pose_change_deg, e.ends_with_movement, e.hr_rise_bpm, e.stage, e.verdict]));
+    writeCsv(join(session, "spo2_episodes.csv"), ["start", "end", "minutes", "spo2_min", "spo2_mean", "max_pose_change_deg", "ends_with_movement", "hr_rise_bpm", "stage", "verdict", "pattern", "longest_run_minutes"],
+      spo2Eps.map((e) => [isoLocal(e.start, zone), isoLocal(e.end, zone), e.minutes, e.spo2_min, e.spo2_mean, e.max_pose_change_deg, e.ends_with_movement, e.hr_rise_bpm, e.stage, e.verdict, e.pattern, e.longest_run_minutes]));
   }
 }
 

@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 from scipy import signal
 
-TZ = "Europe/Berlin"
+from fitbit import session_zone
 BAND = (0.6, 3.5)
 MOTION_THR = 0.03       # m/s², std of |a| over 1 s
 MOTION_PAD_S = 3.0
@@ -33,7 +33,8 @@ def load_ppg(session: Path):
     vals = df["values"].astype(str).str.split(" ", expand=True).apply(pd.to_numeric, errors="coerce")
     vals.columns = [int(c) for c in vals.columns]
     t = df.epoch_ms.values.astype(float)
-    keep = np.r_[True, np.diff(t) > 0]
+    high = np.maximum.accumulate(np.r_[-np.inf, np.where(np.isfinite(t), t, -np.inf)])[:-1]
+    keep = np.isfinite(t) & (t > high)
     return t[keep], vals[keep].reset_index(drop=True)
 
 
@@ -136,7 +137,7 @@ def hrv(beats):
     nn = nn[~near.reindex(nn.index).values]
     # usual artifact rule: more than 20 % away from the local median = no reliable NN interval
     nn = nn[(nn.ibi_ms / nn.ibi_med - 1).abs() <= 0.2]
-    d = nn.ibi_ms.diff()[nn.clean.shift(fill_value=False)]
+    d = nn.ibi_ms.diff().where(nn.index.to_series().diff() == 1)
     return nn, (nn.ibi_ms.std(), np.sqrt(np.mean(d.dropna() ** 2)) if d.notna().any() else np.nan)
 
 
@@ -188,6 +189,7 @@ def main():
     ap.add_argument("--channel", type=int)
     ap.add_argument("--plot", action="store_true")
     args = ap.parse_args()
+    zone = session_zone(args.session)
 
     t_ms, vals = load_ppg(args.session)
     fs = 1000 / np.median(np.diff(t_ms))
@@ -219,7 +221,7 @@ def main():
         lines.append(f"Ectopic beat candidates: {len(events)} ({per_h:.0f} per clean hour) – "
                      + ", ".join(f"{k} {n}" for k, n in events.kind.value_counts().items()))
         for e in events.itertuples():
-            ts = pd.to_datetime(e.epoch_ms, unit="ms", utc=True).tz_convert(TZ).strftime("%H:%M:%S")
+            ts = pd.to_datetime(e.epoch_ms, unit="ms", utc=True).tz_convert(zone).strftime("%H:%M:%S")
             lines.append(f"  {ts} {e.kind}: {e.ibi_ms:.0f} → {e.ibi_next_ms:.0f} ms (median {e.ibi_median_ms:.0f}), "
                          f"mid wave {e.mid_wave_rel}, next beat ×{e.next_beat_amp_rel}")
         lines.append("Note: candidates, not a diagnosis. 'missed pulse' can also be a missed beat.")
@@ -236,7 +238,7 @@ def main():
                      f"{irr.sum()} only irregular, {(~hit & ~irr).sum()} unremarkable "
                      f"(chance of a random hit per window ≈ {chance * 100:.0f} %)")
         for f in felt.itertuples():
-            ts = pd.to_datetime(f.epoch_ms, unit="ms", utc=True).tz_convert(TZ).strftime("%H:%M:%S")
+            ts = pd.to_datetime(f.epoch_ms, unit="ms", utc=True).tz_convert(zone).strftime("%H:%M:%S")
             lines.append(f"  {ts}: {f.pattern}" + (f" ({-f.seconds_before_marker:.1f} s before)"
                                                   if np.isfinite(f.seconds_before_marker) else ""))
         auto_hit = sum(((markers > e - 1000) & (markers < e + 8000)).any() for e in events.epoch_ms) \
@@ -261,7 +263,7 @@ def main():
         fig = plt.figure(figsize=(12, 4 + 2 * ((n_ev + 1) // 2)))
         gs = fig.add_gridspec(2 + (n_ev + 1) // 2, 2)
         ax = fig.add_subplot(gs[0:2, :])
-        tt = pd.to_datetime(beats.epoch_ms, unit="ms", utc=True).dt.tz_convert(TZ).dt.tz_localize(None)
+        tt = pd.to_datetime(beats.epoch_ms, unit="ms", utc=True).dt.tz_convert(zone).dt.tz_localize(None)
         ax.plot(tt[beats.clean], beats.ibi_ms[beats.clean], ".", ms=2, label="clean")
         ax.plot(tt[~beats.clean], beats.ibi_ms[~beats.clean], ".", ms=2, color="lightgrey", label="movement/uncertain")
         f = beats.flag != ""
@@ -269,7 +271,7 @@ def main():
         ax.set_ylim(300, 2000)
         ax.set_ylabel("Beat interval ms")
         for m in markers:
-            ax.axvline(pd.to_datetime(m, unit="ms", utc=True).tz_convert(TZ).tz_localize(None),
+            ax.axvline(pd.to_datetime(m, unit="ms", utc=True).tz_convert(zone).tz_localize(None),
                        color="tab:green", lw=0.8)
         ax.legend(fontsize=8)
         ax.set_title("green line = felt", fontsize=8)
@@ -282,7 +284,7 @@ def main():
             a.plot((bp.epoch_ms - t0) / 1000, np.interp(bp.epoch_ms, t_ms, y), "r.", ms=4)
             if is_marker:
                 a.axvline(0, color="tab:green", lw=1)
-            a.set_title(f"{pd.to_datetime(t0, unit='ms', utc=True).tz_convert(TZ):%H:%M:%S} {label}", fontsize=8)
+            a.set_title(f"{pd.to_datetime(t0, unit='ms', utc=True).tz_convert(zone):%H:%M:%S} {label}", fontsize=8)
             a.tick_params(labelsize=7)
         fig.tight_layout()
         out = args.session / "ppg.png"

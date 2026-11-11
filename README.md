@@ -2,7 +2,7 @@
 
 A Wear OS app that records what your watch's sensors see while you sleep, plus TypeScript tools to analyse it.
 It logs the accelerometer and gyroscope (25 Hz), the heart-rate sensor (~1 Hz) and, on the Pixel Watch, the
-undocumented raw PPG sensor (100 Hz) and the ECG electrode in the crown.
+undocumented raw PPG sensor (100 Hz observed on the original Pixel Watch) and the ECG electrode in the crown.
 
 I built it to check myself for sleep apnea. The whole story, with results from seven nights, is in the blog post:
 [I reverse-engineered my Pixel Watch's raw PPG sensor to check myself for sleep apnea](https://www.swetlow.com/blog/pixel-watch-raw-ppg-sleep-apnea/).
@@ -28,9 +28,7 @@ I built it to check myself for sleep apnea. The whole story, with results from s
 Plus a live analyzer in the browser (pulse wave, beat intervals, breathing, ECG) and Wi-Fi sync from the watch
 to your PC without `adb`.
 
-Only the Pixel Watch 1 has been tested. The raw PPG and ECG sensors are Google-specific and undocumented;
-on other watches the app records only motion and heart rate. Run `adb shell dumpsys sensorservice` to see what
-your watch offers.
+The upstream author tested the original Pixel Watch. On a Pixel Watch 4, run the two-minute sensor test below to establish what your watch and firmware expose. Motion, standard heart rate, optical samples, and controller events are recorded independently.
 
 ## Quick start
 
@@ -46,20 +44,20 @@ adb connect <watch-ip>:<debug-port>
 **2. Install the app.** Open this folder in Android Studio, pick the watch, *Run*. Or: `./gradlew installDebug`.
 Open *SleepLogger* on the watch and allow the permissions.
 
-**3. Record a night.** Charge the watch to 100 %. In bed, tap **Start** (motion + heart rate, ~10 % battery
-per hour) or **Start + PPG** (adds raw PPG, ~13 % per hour and ~27 MB per hour). In the morning tap **Stop**.
-Do a 30-minute test first.
+**3. Test the optical sensor.** Tap **2-min sensor test**, wear the watch snugly and rest your arm. The PPG line shows the optical sample count, measured rate, age of the latest sample and whether values are changing. Controller and extended-HR counts have their own lines. The test stops and saves automatically. Tap **Sync to PC** when the receiver is running. See [the Pixel Watch 4 test procedure](docs/manual.md#pixel-watch-4-first-recording).
 
-**4. Get the data onto your PC.**
+**4. Record overnight.** Tap **Overnight PPG** and leave **Live view overnight** unchecked for local recording with normal screen timeout. First try a 30-minute screen-off recording to measure sample continuity and battery drain on your watch. Tap **Stop** to finish. **Start** still records motion and standard HR, and **Start + PPG** retains the interactive live workflow.
+
+**5. Get the data onto your PC.**
 ```
 cd analysis-ts
-npm install
+npm ci
 npm run sync
 ```
-On the watch tap **Sync to PC** (it also runs by itself after *Stop*). Sessions land in `sessions/<start time>/`.
+Use the desktop receiver from this branch. **Sync to PC** copies sessions and keeps the originals on the watch. Manual **Stop** also starts a copy after the files close. Sessions land in `sessions/<start time>/`.
 Allow Node.js on *private networks* when Windows asks. Fallback over adb: `npm run pull`.
 
-**5. Analyse.**
+**6. Analyse.**
 ```
 npm run analyze -- ../sessions/<session>    # summary.txt, breathing.csv, movement_events.csv, per_minute.csv, CVHR
 npm run ppg     -- ../sessions/<session>    # PPG nights: ppg_summary.txt, ppg_beats.csv (beats, HRV, ectopic candidates)
@@ -98,7 +96,12 @@ Every recording is a folder `sessions/<YYYYMMDD_HHMMSS>/` with plain CSV:
 - `hr.csv`: `epoch_ms,bpm,accuracy`
 - `events.csv`: start/stop, sensors used, battery every 10 min, markers you tapped
 - with PPG: `raw_ppg.csv`, `raw_ppg_ctrl.csv`, `raw_hr_ext.csv` as `epoch_ms,accuracy,n,values`
-  (values space-separated; channel meanings in the manual)
+  (space-separated values; trailing zeros are trimmed). Each raw stream has a matching `*_timing.csv`
+  with the original monotonic sensor timestamp in nanoseconds and original event width, in row order.
+- `session.json` records model, OS build, app revision, time zone, recording mode, session ID and segment linkage.
+- `sensor_report.json` records per-stream registration, sample counts, rates, event widths and maximum observed gaps.
+- `session_manifest.json` stores file sizes and SHA-256 hashes after a segment closes successfully.
+- The desktop PPG analysis writes `ppg_segments.csv` with per-segment channel, sample rate, exclusions and clean duration.
 
 ## Limits
 
